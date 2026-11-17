@@ -13,6 +13,7 @@ use std::path::Path;
 #[cfg(feature = "guest_debug")]
 use std::path::PathBuf;
 use std::ptr::from_ref;
+use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::{any, cmp, env, io, num, process, str};
 
@@ -30,6 +31,7 @@ use vmm::api::dbus::{DBusApiOptions, dbus_api_graceful_shutdown};
 use vmm::api::http::http_api_graceful_shutdown;
 use vmm::api::{self, ApiAction};
 use vmm::config::{self, RestoreConfig, VmParams};
+use vmm::fork::{ForkBranch, ForkOperations, ForkState};
 use vmm::landlock::{Landlock, LandlockError};
 use vmm::seccomp_filters::{Thread, get_seccomp_filter};
 use vmm::vm::Vm;
@@ -139,6 +141,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[derive(Error, Debug)]
 enum Error {
+    #[error("Failed to prepare fork child")]
+    ForkChild(#[source] io::Error),
     #[error("Failed to create API EventFd")]
     CreateApiEventFd(#[source] io::Error),
     #[cfg(feature = "guest_debug")]
@@ -213,7 +217,7 @@ enum FdTableError {
     #[error("Error calling fcntl with F_GETFD")]
     GetFd(#[source] io::Error),
     #[error("Failed to duplicate file handle")]
-    Dup2(#[source] io::Error),
+    Expand(#[source] io::Error),
 }
 
 fn prepare_default_values() -> (String, String, String) {
@@ -505,6 +509,10 @@ fn get_cli_options_sorted(
             .num_args(0..=1)
             .default_missing_value("")
             .group("vm-config"),
+        Arg::new("enable-fork")
+            .long("enable-fork")
+            .action(ArgAction::SetTrue)
+            .help("Enable experimental same-host VM fork and its supervisor seccomp policy"),
         Arg::new("seccomp")
             .long("seccomp")
             .num_args(1)
@@ -633,10 +641,6 @@ fn start_vmm(
         .map(|()| log::set_max_level(log_level))
         .map_err(Error::LoggerSetup)?;
 
-    let (api_request_sender, api_request_receiver) = channel();
-    let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
-
-    let api_request_sender_clone = api_request_sender.clone();
     let seccomp_action = if let Some(seccomp_value) = cmd_arguments.get_one::<String>("seccomp") {
         match seccomp_value as &str {
             "true" => SeccompAction::Trap,
@@ -683,10 +687,6 @@ fn start_vmm(
 
     info!("{} starting", env!("BUILD_VERSION"));
 
-    let hypervisor = hypervisor::new().map_err(Error::CreateHypervisor)?;
-    let main_seccomp_filter = get_seccomp_filter(&seccomp_action, Thread::Main, None)
-        .map_err(Error::CreateSeccompFilter)?;
-
     #[cfg(feature = "guest_debug")]
     let gdb_socket_path = if let Some(gdb_config) = cmd_arguments.get_one::<String>("gdb") {
         let mut parser = OptionParser::new();
@@ -701,11 +701,6 @@ fn start_vmm(
     } else {
         None
     };
-    #[cfg(feature = "guest_debug")]
-    let debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
-    #[cfg(feature = "guest_debug")]
-    let vm_debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
-
     let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
     let landlock_enable = cmd_arguments.get_flag("landlock");
     let no_shutdown = cmd_arguments.get_flag("no-shutdown");
@@ -748,7 +743,7 @@ fn start_vmm(
         .transpose()?;
 
     #[cfg(feature = "dbus_api")]
-    let dbus_options = match (
+    let mut dbus_options = match (
         cmd_arguments.get_one::<String>("dbus-service-name"),
         cmd_arguments.get_one::<String>("dbus-object-path"),
     ) {
@@ -784,107 +779,268 @@ fn start_vmm(
         .map_err(Error::EventMonitorThread)?;
     }
 
-    event!("vmm", "starting");
-
-    let vmm_thread_handle = vmm::start_vmm_thread(
-        vmm::VmmVersionInfo::new(env!("BUILD_VERSION"), env!("CARGO_PKG_VERSION")),
-        api_socket_path,
-        api_socket_fd,
-        #[cfg(feature = "dbus_api")]
-        dbus_options,
-        api_evt.try_clone().unwrap(),
-        api_request_sender_clone,
-        api_request_receiver,
-        #[cfg(feature = "guest_debug")]
-        gdb_socket_path,
-        #[cfg(feature = "guest_debug")]
-        debug_evt.try_clone().unwrap(),
-        #[cfg(feature = "guest_debug")]
-        vm_debug_evt.try_clone().unwrap(),
-        exit_evt.try_clone().unwrap(),
-        &seccomp_action,
-        hypervisor,
-        no_shutdown,
-        landlock_enable,
-    )
-    .map_err(Error::StartVmmThread)?;
-
-    // Spawn workers first so they do not inherit main's narrower filter.
-    if !main_seccomp_filter.is_empty() {
-        seccompiler::apply_filter(&main_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+    let mut fork_enabled = cfg!(all(target_arch = "x86_64", feature = "kvm"))
+        && cmd_arguments.get_flag("enable-fork")
+        && api_socket_path.is_some()
+        && api_socket_fd.is_none()
+        && !landlock_enable
+        && !cmd_arguments.contains_id("event-monitor");
+    #[cfg(feature = "dbus_api")]
+    {
+        fork_enabled &= dbus_options.is_none();
     }
+    #[cfg(feature = "guest_debug")]
+    {
+        fork_enabled &= gdb_socket_path.is_none();
+    }
+    // Also exclude instrumentation that may own background threads.
+    fork_enabled &= !cfg!(any(feature = "tracing", feature = "dhat-heap"));
+    let main_seccomp_filter = if fork_enabled {
+        let hypervisor = hypervisor::new().map_err(Error::CreateHypervisor)?;
+        get_seccomp_filter(
+            &seccomp_action,
+            Thread::ForkSupervisor,
+            Some(hypervisor.hypervisor_type()),
+        )
+    } else {
+        get_seccomp_filter(&seccomp_action, Thread::Main, None)
+    }
+    .map_err(Error::CreateSeccompFilter)?;
+    let mut socket_path = api_socket_path.clone();
+    let mut restore_fork: Option<ForkState> = None;
+    let operations: ForkOperations = Default::default();
+    let mut completion: Option<Result<ForkBranch, String>> = None;
+    let mut initial_start = true;
+    let mut exit_evt = exit_evt;
+    loop {
+        #[cfg(feature = "guest_debug")]
+        let debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
+        #[cfg(feature = "guest_debug")]
+        let vm_debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
 
-    // API endpoints (HTTP, D-Bus) are set up at this point (if API socket is
-    // configured)
-    event!("vmm", "started");
+        let (api_request_sender, api_request_receiver) = channel();
+        let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
+        let hypervisor = hypervisor::new().map_err(Error::CreateHypervisor)?;
+        event!("vmm", "starting");
 
-    let r: Result<(), Error> = (|| {
-        #[cfg(feature = "igvm")]
-        let payload_present = cmd_arguments.contains_id("kernel")
-            || cmd_arguments.contains_id("firmware")
-            || cmd_arguments.contains_id("igvm");
-        #[cfg(not(feature = "igvm"))]
-        let payload_present =
-            cmd_arguments.contains_id("kernel") || cmd_arguments.contains_id("firmware");
-
-        if payload_present {
-            let vm_params = VmParams::from_arg_matches(cmd_arguments);
-            let vm_config = VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
-
-            // Create and boot the VM based off the VM config we just built.
-            let sender = api_request_sender.clone();
-            api::VmCreate
-                .send(
-                    api_evt.try_clone().unwrap(),
-                    api_request_sender,
-                    Box::new(vm_config),
-                )
-                .map_err(Error::VmCreate)?;
-            api::VmBoot
-                .send(api_evt.try_clone().unwrap(), sender, ())
-                .map_err(Error::VmBoot)?;
-        } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
-            api::VmRestore
-                .send(
-                    api_evt.try_clone().unwrap(),
-                    api_request_sender,
-                    RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?,
-                )
-                .map_err(Error::VmRestore)?;
+        if let Some(state) = restore_fork.as_mut() {
+            // fork may give the child a compact fdtable. Grow it while still
+            // single-threaded, before device/API workers can force an RCU wait.
+            state.mark("fdtable_begin");
+            if let Err(error) = expand_fdtable() {
+                warn!("Error expanding fork FD table: {error}");
+            }
+            state.mark("fdtable_ready");
+            if let Err(error) = state.start_disk_retirement(Arc::clone(&operations)) {
+                warn!("Cannot start disk retirement: {error}");
+            }
+            if let Err(error) = state.start_disk_merge() {
+                warn!("Cannot start background disk merge: {error}");
+            }
+        }
+        if let Some(state) = &restore_fork {
+            state.mark("runtime_start");
+        }
+        let mut restore_context = restore_fork.clone();
+        let vmm_result = vmm::start_vmm_thread(
+            vmm::VmmVersionInfo::new(env!("BUILD_VERSION"), env!("CARGO_PKG_VERSION")),
+            &socket_path,
+            api_socket_fd,
+            #[cfg(feature = "dbus_api")]
+            dbus_options.take(),
+            api_evt.try_clone().unwrap(),
+            api_request_sender.clone(),
+            api_request_receiver,
+            #[cfg(feature = "guest_debug")]
+            gdb_socket_path.clone(),
+            #[cfg(feature = "guest_debug")]
+            debug_evt.try_clone().unwrap(),
+            #[cfg(feature = "guest_debug")]
+            vm_debug_evt.try_clone().unwrap(),
+            exit_evt.try_clone().unwrap(),
+            &seccomp_action,
+            hypervisor,
+            no_shutdown,
+            landlock_enable,
+            fork_enabled,
+            restore_fork.take(),
+            Arc::clone(&operations),
+        );
+        let vmm_thread_handle = match vmm_result {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(Ok(branch)) = completion.take()
+                    && branch.child
+                {
+                    let _ =
+                        branch.report(&Err(format!("Child runtime restoration failed: {error:?}")));
+                }
+                return Err(Error::StartVmmThread(error));
+            }
+        };
+        if let (Some(mut state), Some(outcome)) = (restore_context.take(), completion.take()) {
+            state.mark("runtime_ready");
+            match outcome {
+                Ok(branch) if branch.child => {
+                    state.update_operation(&operations, Some(Ok(())));
+                    if let Err(e) = branch.report(&Ok(())) {
+                        warn!("Fork parent lost readiness channel: {e}");
+                        exit_evt.write(1).map_err(Error::CreateExitEventFd)?;
+                    }
+                }
+                outcome => {
+                    state.parent_ready();
+                    let result = outcome.and_then(|branch| branch.wait());
+                    state.mark("both_ready");
+                    if result.is_err() && state.was_running {
+                        // The child has failed, but the original machine has
+                        // already been reconstructed. Restore its prior run state.
+                        if let Err(e) = api::VmResume.send(
+                            api_evt.try_clone().unwrap(),
+                            api_request_sender.clone(),
+                            (),
+                        ) {
+                            warn!("Failed resuming parent after fork failure: {e}");
+                            state.update_operation(
+                                &operations,
+                                Some(Err(format!("{result:?}; parent resume failed: {e}"))),
+                            );
+                        } else {
+                            state.update_operation(&operations, Some(result));
+                        }
+                    } else {
+                        state.update_operation(&operations, Some(result));
+                    }
+                }
+            }
         }
 
-        Ok(())
-    })();
+        // Spawn workers first so they do not inherit main's narrower filter.
+        if initial_start && !main_seccomp_filter.is_empty() {
+            seccompiler::apply_filter(&main_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+        }
 
-    if r.is_err()
-        && let Err(e) = exit_evt.write(1)
-    {
-        warn!("writing to exit EventFd: {e}");
+        // API endpoints (HTTP, D-Bus) are set up at this point (if API socket is
+        // configured)
+        event!("vmm", "started");
+
+        let r: Result<(), Error> = (|| {
+            #[cfg(feature = "igvm")]
+            let payload_present = cmd_arguments.contains_id("kernel")
+                || cmd_arguments.contains_id("firmware")
+                || cmd_arguments.contains_id("igvm");
+            #[cfg(not(feature = "igvm"))]
+            let payload_present =
+                cmd_arguments.contains_id("kernel") || cmd_arguments.contains_id("firmware");
+
+            if !initial_start {
+                return Ok(());
+            }
+            if payload_present {
+                let vm_params = VmParams::from_arg_matches(cmd_arguments);
+                let vm_config = VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
+
+                // Create and boot the VM based off the VM config we just built.
+                let sender = api_request_sender.clone();
+                api::VmCreate
+                    .send(
+                        api_evt.try_clone().unwrap(),
+                        api_request_sender.clone(),
+                        Box::new(vm_config),
+                    )
+                    .map_err(Error::VmCreate)?;
+                api::VmBoot
+                    .send(api_evt.try_clone().unwrap(), sender, ())
+                    .map_err(Error::VmBoot)?;
+            } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
+                api::VmRestore
+                    .send(
+                        api_evt.try_clone().unwrap(),
+                        api_request_sender.clone(),
+                        RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?,
+                    )
+                    .map_err(Error::VmRestore)?;
+            }
+
+            Ok(())
+        })();
+
+        if r.is_err()
+            && let Err(e) = exit_evt.write(1)
+        {
+            warn!("writing to exit EventFd: {e}");
+        }
+
+        if landlock_enable {
+            Landlock::new()
+                .map_err(Error::CreateLandlock)?
+                .restrict_self()
+                .map_err(Error::ApplyLandlock)?;
+        }
+
+        let vmm_result = vmm_thread_handle.thread_handle.join();
+        if let Ok(Ok(Some(state))) = &vmm_result {
+            state.mark("vmm_joined");
+        }
+
+        if let Some(api_handle) = vmm_thread_handle.http_api_handle {
+            http_api_graceful_shutdown(api_handle).map_err(Error::HttpApiShutdown)?;
+        }
+
+        #[cfg(feature = "dbus_api")]
+        if let Some(chs) = vmm_thread_handle.dbus_shutdown_chs {
+            dbus_api_graceful_shutdown(chs);
+        }
+
+        let pending_fork = vmm_result
+            .map_err(Error::ThreadJoin)?
+            .map_err(Error::VmmThread)?;
+
+        // All API senders/receivers and eventfds must be discarded before fork;
+        // otherwise child and parent could signal each other's old event queues.
+        drop(api_request_sender);
+        drop(api_evt);
+        drop(exit_evt);
+        #[cfg(feature = "guest_debug")]
+        {
+            drop(debug_evt);
+            drop(vm_debug_evt);
+        }
+        r?;
+        let Some(mut state) = pending_fork else {
+            return Ok(());
+        };
+        state.mark("api_stopped");
+        let original_pid = std::process::id();
+        let outcome = state.fork_host();
+        // A failed child must never recover the parent's API socket or VM.
+        let outcome = if std::process::id() != original_pid {
+            Ok(outcome.map_err(Error::ForkChild)?)
+        } else {
+            outcome
+        }
+        .map_err(|e| e.to_string());
+        if outcome.is_err() {
+            state
+                .finish_disks_before_rollback()
+                .map_err(Error::ForkChild)?;
+        }
+        let child = outcome.as_ref().is_ok_and(|branch| branch.child);
+        state.update_operation(&operations, None);
+        completion = Some(outcome);
+        if child {
+            socket_path = Some(
+                state
+                    .request
+                    .child_api_socket
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        restore_fork = Some(state);
+        initial_start = false;
+        exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
     }
-
-    if landlock_enable {
-        Landlock::new()
-            .map_err(Error::CreateLandlock)?
-            .restrict_self()
-            .map_err(Error::ApplyLandlock)?;
-    }
-
-    vmm_thread_handle
-        .thread_handle
-        .join()
-        .map_err(Error::ThreadJoin)?
-        .map_err(Error::VmmThread)?;
-
-    if let Some(api_handle) = vmm_thread_handle.http_api_handle {
-        http_api_graceful_shutdown(api_handle).map_err(Error::HttpApiShutdown)?;
-    }
-
-    #[cfg(feature = "dbus_api")]
-    if let Some(chs) = vmm_thread_handle.dbus_shutdown_chs {
-        dbus_api_graceful_shutdown(chs);
-    }
-
-    r
 }
 
 // This is a best-effort solution to the latency induced by the RCU
@@ -912,6 +1068,17 @@ fn start_vmm(
 // The code tries to resize the table to an adequate size for most use cases,
 // 4096, this way we avoid any expansion that might take place later.
 fn expand_fdtable() -> Result<(), FdTableError> {
+    let fdsize = || {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    l.strip_prefix("FDSize:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+            })
+    };
+    let before = std::env::var_os("CH_FORK_TIMING").and_then(|_| fdsize());
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -949,12 +1116,21 @@ fn expand_fdtable() -> Result<(), FdTableError> {
         return Err(FdTableError::GetFd(err));
     }
     // SAFETY: FFI call with valid arguments
-    if unsafe { libc::dup2(dummy_evt.as_raw_fd(), table_size - 1) } < 0 {
-        return Err(FdTableError::Dup2(io::Error::last_os_error()));
+    let expanded_fd =
+        unsafe { libc::fcntl(dummy_evt.as_raw_fd(), libc::F_DUPFD_CLOEXEC, table_size - 1) };
+    if expanded_fd < 0 {
+        return Err(FdTableError::Expand(io::Error::last_os_error()));
     }
     // SAFETY: FFI call, trivially
-    unsafe { libc::close(table_size - 1) };
-
+    unsafe { libc::close(expanded_fd) };
+    if let Some(before) = before {
+        eprintln!(
+            "VM_FORK fdtable pid={} before={} after={}",
+            process::id(),
+            before,
+            fdsize().unwrap_or(0)
+        );
+    }
     Ok(())
 }
 
@@ -1024,6 +1200,26 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fdtable_expansion_preserves_open_handles() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let event = vmm_sys_util::eventfd::EventFd::new(0).unwrap();
+        // SAFETY: duplicate into a free slot without replacing any live FD.
+        let high = unsafe { libc::fcntl(event.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 127) };
+        assert!(high >= 127);
+        // SAFETY: successful fcntl returned this exclusively owned descriptor.
+        let high = unsafe { OwnedFd::from_raw_fd(high) };
+        super::expand_fdtable().unwrap();
+        event.write(7).unwrap();
+        let mut value = 0u64;
+        // SAFETY: valid event FD and writable 8-byte buffer.
+        assert_eq!(
+            unsafe { libc::read(high.as_raw_fd(), (&mut value as *mut u64).cast(), 8) },
+            8
+        );
+        assert_eq!(value, 7);
+    }
+
     use std::mem::zeroed;
     use std::path::PathBuf;
     use std::ptr::from_mut;

@@ -272,6 +272,7 @@ pub struct MemoryManager {
     // This is useful for getting the dirty pages as we need to know the
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
+    retained_ram_slots: Option<Vec<GuestRamMapping>>,
     uffd_handler: Option<UffdHandler>,
 
     pub acpi_address: Option<GuestAddress>,
@@ -455,6 +456,9 @@ pub enum Error {
     /// Memory size is misaligned with default page size or its hugepage size
     #[error("Memory size is misaligned with default page size or its hugepage size")]
     MisalignedMemorySize,
+
+    #[error("Inherited RAM does not match the snapshot memory layout")]
+    InvalidInheritedMemory,
 
     /// Failed to prefault memory
     #[error("Failed to prefault memory")]
@@ -853,7 +857,17 @@ impl MemoryManager {
         zones_config: &[MemoryZoneConfig],
         mut existing_memory_files: HashMap<u32, File>,
         thp: bool,
+        inherited_memory: Option<&GuestMemoryMmap>,
     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
+        if let Some(memory) = inherited_memory
+            && (memory.iter().count() != guest_ram_mappings.len()
+                || guest_ram_mappings.iter().any(|mapping| {
+                    mapping.virtio_mem
+                        || !zones_config.iter().any(|zone| zone.id == mapping.zone_id)
+                }))
+        {
+            return Err(Error::InvalidInheritedMemory);
+        }
         let mut memory_regions = Vec::new();
         let mut memory_zones = HashMap::new();
 
@@ -873,23 +887,37 @@ impl MemoryManager {
         for guest_ram_mapping in guest_ram_mappings {
             for zone_config in zones_config {
                 if guest_ram_mapping.zone_id == zone_config.id {
-                    let region = MemoryManager::create_ram_region(
-                        if guest_ram_mapping.virtio_mem {
-                            &None
-                        } else {
-                            &zone_config.file
-                        },
-                        guest_ram_mapping.file_offset,
-                        GuestAddress(guest_ram_mapping.gpa),
-                        guest_ram_mapping.size as usize,
-                        zone_config.reserve.unwrap_or(zone_config.hugepages),
-                        zone_config.shared,
-                        zone_config.hugepages,
-                        zone_config.hugepage_size,
-                        zone_config.host_numa_node,
-                        existing_memory_files.remove(&guest_ram_mapping.slot),
-                        thp,
-                    )?;
+                    let region = if let Some(memory) = inherited_memory {
+                        let region = memory
+                            .iter()
+                            .find(|region| {
+                                region.start_addr().0 == guest_ram_mapping.gpa
+                                    && region.len() == guest_ram_mapping.size
+                            })
+                            .ok_or(Error::InvalidInheritedMemory)?;
+                        Arc::new(
+                            GuestRegionMmap::with_arc(region.get_mmap(), region.start_addr())
+                                .ok_or(Error::GuestAddressOverFlow)?,
+                        )
+                    } else {
+                        MemoryManager::create_ram_region(
+                            if guest_ram_mapping.virtio_mem {
+                                &None
+                            } else {
+                                &zone_config.file
+                            },
+                            guest_ram_mapping.file_offset,
+                            GuestAddress(guest_ram_mapping.gpa),
+                            guest_ram_mapping.size as usize,
+                            zone_config.reserve.unwrap_or(zone_config.hugepages),
+                            zone_config.shared,
+                            zone_config.hugepages,
+                            zone_config.hugepage_size,
+                            zone_config.host_numa_node,
+                            existing_memory_files.remove(&guest_ram_mapping.slot),
+                            thp,
+                        )?
+                    };
                     memory_regions.push(Arc::clone(&region));
                     if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
                         if guest_ram_mapping.virtio_mem {
@@ -1867,7 +1895,40 @@ impl MemoryManager {
         }
     }
 
+    /// The retained parent KVM still maps these exact inherited host addresses.
+    /// Device mappings have been removed by device teardown; keep RAM slot IDs
+    /// and rebuild only the userspace address allocators, without an overlapping
+    /// KVM_SET_USER_MEMORY_REGION or an EPT teardown.
+    pub fn retain_fork_ram_slots(&mut self, data: &MemoryManagerSnapshotData) -> Result<(), Error> {
+        let memory = self.guest_memory.memory();
+        let mut slots = std::collections::HashSet::new();
+        if data.guest_ram_mappings.len() != memory.iter().count()
+            || data.guest_ram_mappings.iter().any(|mapping| {
+                mapping.virtio_mem
+                    || !slots.insert(mapping.slot)
+                    || !memory.iter().any(|region| {
+                        region.start_addr().raw_value() == mapping.gpa
+                            && region.len() == mapping.size
+                    })
+            })
+        {
+            return Err(Error::InvalidInheritedMemory);
+        }
+        let next = slots
+            .iter()
+            .max()
+            .copied()
+            .and_then(|slot| slot.checked_add(1))
+            .ok_or(Error::InvalidInheritedMemory)?;
+        self.next_memory_slot.store(next, Ordering::SeqCst);
+        *self.memory_slot_free_list.lock().unwrap() =
+            (0..next).filter(|slot| !slots.contains(slot)).collect();
+        self.retained_ram_slots = Some(data.guest_ram_mappings.clone());
+        Ok(())
+    }
+
     pub fn allocate_address_space(&mut self) -> Result<(), Error> {
+        let mut retained = self.retained_ram_slots.take();
         let mut list = Vec::new();
 
         for (zone_id, memory_zone) in self.memory_zones.iter() {
@@ -1887,18 +1948,31 @@ impl MemoryManager {
 
         for (zone_id, regions, zone_mergeable) in list {
             for (region, virtio_mem) in regions {
-                // SAFETY: guaranteed by GuestRegionMmap invariants
-                let slot = unsafe {
-                    self.create_userspace_mapping(
-                        region.start_addr().raw_value(),
-                        region.len().try_into().unwrap(),
-                        region.as_ptr(),
-                        zone_mergeable,
-                        false,
-                        self.log_dirty,
-                        hypervisor::MemoryVisibility::Private,
-                    )
-                }?;
+                let slot = if let Some(mappings) = retained.as_mut() {
+                    let index = mappings
+                        .iter()
+                        .position(|mapping| {
+                            mapping.gpa == region.start_addr().raw_value()
+                                && mapping.size == region.len()
+                                && mapping.zone_id == zone_id
+                                && mapping.virtio_mem == virtio_mem
+                        })
+                        .ok_or(Error::InvalidInheritedMemory)?;
+                    mappings.remove(index).slot
+                } else {
+                    // SAFETY: guaranteed by GuestRegionMmap invariants.
+                    unsafe {
+                        self.create_userspace_mapping(
+                            region.start_addr().raw_value(),
+                            region.len().try_into().unwrap(),
+                            region.as_ptr(),
+                            zone_mergeable,
+                            false,
+                            self.log_dirty,
+                            hypervisor::MemoryVisibility::Private,
+                        )
+                    }?
+                };
 
                 let file_offset = if let Some(file_offset) = region.file_offset() {
                     file_offset.start()
@@ -1991,6 +2065,29 @@ impl MemoryManager {
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        Self::new_with_inherited_memory(
+            vm,
+            config,
+            prefault,
+            phys_bits,
+            #[cfg(feature = "tdx")]
+            tdx_enabled,
+            restore_data,
+            existing_memory_files,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_inherited_memory(
+        vm: Arc<dyn hypervisor::Vm>,
+        config: &MemoryConfig,
+        prefault: Option<bool>,
+        phys_bits: u8,
+        #[cfg(feature = "tdx")] tdx_enabled: bool,
+        restore_data: Option<&MemoryManagerSnapshotData>,
+        existing_memory_files: HashMap<u32, File>,
+        inherited_memory: Option<&GuestMemoryMmap>,
+    ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
         let user_provided_zones = config.size == 0;
@@ -2025,6 +2122,7 @@ impl MemoryManager {
                 &zones,
                 existing_memory_files,
                 config.thp,
+                inherited_memory,
             )?;
             let guest_memory =
                 GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestRegionCollection)?;
@@ -2234,6 +2332,7 @@ impl MemoryManager {
             snapshot_memory_ranges: MemoryRangeTable::default(),
             memory_zones,
             guest_ram_mappings: Vec::new(),
+            retained_ram_slots: None,
             uffd_handler: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
@@ -3925,6 +4024,64 @@ fn do_mmap_cow_saved_regions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inherited_ram_keeps_mapping_and_rejects_mismatched_layout() {
+        use std::collections::HashMap;
+
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
+
+        use super::{Error, GuestMemoryMmap, GuestRamMapping, MemoryManager, MemoryZoneConfig};
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        memory.write_obj(10u64, GuestAddress(0)).unwrap();
+        let zones: Vec<MemoryZoneConfig> =
+            vec![serde_json::from_value(serde_json::json!({"id": "ram", "size": 4096})).unwrap()];
+        let mut mappings = vec![GuestRamMapping {
+            slot: 0,
+            gpa: 0,
+            size: 4096,
+            zone_id: "ram".to_owned(),
+            virtio_mem: false,
+            file_offset: 0,
+        }];
+        let (regions, _) = MemoryManager::restore_memory_regions_and_zones(
+            &mappings,
+            &zones,
+            HashMap::new(),
+            false,
+            Some(&memory),
+        )
+        .unwrap();
+        assert_eq!(regions[0].as_ptr(), memory.iter().next().unwrap().as_ptr());
+        assert_eq!(
+            regions[0]
+                .read_obj::<u64>(vm_memory::MemoryRegionAddress(0))
+                .unwrap(),
+            10
+        );
+        mappings[0].size = 8192;
+        assert!(matches!(
+            MemoryManager::restore_memory_regions_and_zones(
+                &mappings,
+                &zones,
+                HashMap::new(),
+                false,
+                Some(&memory),
+            ),
+            Err(Error::InvalidInheritedMemory)
+        ));
+        assert!(matches!(
+            MemoryManager::restore_memory_regions_and_zones(
+                &[],
+                &zones,
+                HashMap::new(),
+                false,
+                Some(&memory),
+            ),
+            Err(Error::InvalidInheritedMemory)
+        ));
+    }
+
     #[test]
     fn guest_ram_stays_clear_of_reserved() {
         use arch::RegionType;

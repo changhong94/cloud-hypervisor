@@ -143,6 +143,7 @@ pub(super) fn shared_backing_from(bf: BackingFile) -> BlockResult<Arc<dyn Backin
     let (kind, virtual_size) = bf.into_kind();
 
     match kind {
+        BackingKind::Inherited { reader, .. } => Ok(reader),
         BackingKind::Raw(file) => Ok(Arc::new(RawBacking { file, virtual_size })),
         BackingKind::Qcow { inner, backing } => {
             let data_file =

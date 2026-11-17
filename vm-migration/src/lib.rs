@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -142,18 +144,80 @@ pub trait Pausable {
 /// separate sections.
 /// Splitting a component migration data into different sections
 /// allows for easier and forward compatible extensions.
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct SnapshotData {
     state: String,
+    #[serde(skip)]
+    cached: Option<Arc<CachedSnapshotState>>,
+}
+
+// Immutable owned state can be inherited by an in-process restore without a
+// JSON round trip. Persisting or transporting it still uses the original wire
+// format; the cache is never part of that format.
+struct CachedSnapshotState {
+    value: Box<dyn Any + Send + Sync>,
+    json: OnceLock<String>,
+    encode: fn(&dyn Any) -> Result<String, serde_json::Error>,
+}
+
+impl Serialize for SnapshotData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let json = self.json().map_err(serde::ser::Error::custom)?;
+        let mut data = serializer.serialize_struct("SnapshotData", 1)?;
+        data.serialize_field("state", json)?;
+        data.end()
+    }
 }
 
 impl SnapshotData {
+    fn json(&self) -> Result<&str, MigratableError> {
+        let Some(cached) = &self.cached else {
+            return Ok(&self.state);
+        };
+        if cached.json.get().is_none() {
+            let json = (cached.encode)(cached.value.as_ref())
+                .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {e}")))?;
+            // Concurrent serializers may compute the same immutable value. Only
+            // one publishes it; all readers use the published allocation.
+            let _ = cached.json.set(json);
+        }
+        Ok(cached.json.get().unwrap())
+    }
+
+    /// Capture owned state without encoding it until transport is requested.
+    pub fn new_from_owned_state<T: Serialize + Send + Sync + 'static>(state: T) -> Self {
+        Self {
+            state: String::new(),
+            cached: Some(Arc::new(CachedSnapshotState {
+                value: Box::new(state),
+                json: OnceLock::new(),
+                encode: |value| serde_json::to_string(value.downcast_ref::<T>().unwrap()),
+            })),
+        }
+    }
+
+    /// Restore from immutable native state, or decode an ordinary saved snapshot.
+    pub fn to_owned_state<T>(&self) -> Result<T, MigratableError>
+    where
+        T: Clone + serde::de::DeserializeOwned + 'static,
+    {
+        if let Some(value) = self
+            .cached
+            .as_ref()
+            .and_then(|c| c.value.downcast_ref::<T>())
+        {
+            return Ok(value.clone());
+        }
+        self.to_state()
+    }
+
     /// Generate the state data from the snapshot data
     pub fn to_state<'a, T>(&'a self) -> Result<T, MigratableError>
     where
         T: Deserialize<'a>,
     {
-        serde_json::from_str(&self.state)
+        serde_json::from_str(self.json()?)
             .map_err(|e| MigratableError::Restore(anyhow!("Error deserialising: {e}")))
     }
 
@@ -165,7 +229,10 @@ impl SnapshotData {
         let state = serde_json::to_string(state)
             .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {e}")))?;
 
-        Ok(SnapshotData { state })
+        Ok(SnapshotData {
+            state,
+            cached: None,
+        })
     }
 }
 
@@ -208,6 +275,21 @@ impl Snapshot {
         Ok(Snapshot::from_data(SnapshotData::new_from_state(state)?))
     }
 
+    /// Keep a pure, owned state value for same-process/fork restore. Serialization
+    /// still emits the original wire format through SnapshotData.
+    pub fn new_from_owned_state<T: Serialize + Send + Sync + 'static>(state: T) -> Self {
+        Self::from_data(SnapshotData::new_from_owned_state(state))
+    }
+
+    pub fn to_owned_state<T: Clone + serde::de::DeserializeOwned + Send + Sync + 'static>(
+        &self,
+    ) -> Result<T, MigratableError> {
+        self.snapshot_data
+            .as_ref()
+            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing snapshot data")))?
+            .to_owned_state()
+    }
+
     /// Add a sub-component's Snapshot to the Snapshot.
     pub fn add_snapshot(&mut self, id: String, snapshot: Snapshot) {
         self.snapshots.insert(id, snapshot);
@@ -238,6 +320,16 @@ where
     } else {
         Ok(None)
     }
+}
+
+/// Restore an independent copy of pure state, or decode a persisted snapshot.
+pub fn owned_state_from_id<T: Clone + serde::de::DeserializeOwned + Send + Sync + 'static>(
+    snapshot: Option<&Snapshot>,
+    id: &str,
+) -> Result<Option<T>, MigratableError> {
+    snapshot_from_id(snapshot, id)
+        .map(Snapshot::to_owned_state)
+        .transpose()
 }
 
 /// A snapshottable component can be snapshotted.
@@ -315,5 +407,75 @@ pub trait Migratable: Send + Pausable + Snapshottable + Transportable {
 
     fn notify_completed_migration(&mut self) -> result::Result<(), MigratableError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod owned_snapshot_tests {
+    use super::*;
+    #[test]
+    fn owned_state_preserves_wire_format_and_independent_restores() {
+        let original = vec![1_u64, 2, 3, u64::MAX];
+        let lazy = SnapshotData::new_from_owned_state(original.clone());
+        let mut parent: Vec<u64> = lazy.to_owned_state().unwrap();
+        let child: Vec<u64> = lazy.clone().to_owned_state().unwrap();
+        parent[0] = 99;
+        assert_eq!(child, original);
+        assert!(lazy.cached.as_ref().unwrap().json.get().is_none());
+        let ordinary = SnapshotData::new_from_state(&original).unwrap();
+        let wire = serde_json::to_string(&lazy).unwrap();
+        assert_eq!(wire, serde_json::to_string(&ordinary).unwrap());
+        let decoded: SnapshotData = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded.to_owned_state::<Vec<u64>>().unwrap(), original);
+        assert_eq!(lazy.to_state::<Vec<u64>>().unwrap(), original);
+    }
+
+    #[test]
+    fn owned_snapshot_tree_keeps_wire_format_and_restores_independent_values() {
+        let mut native = Snapshot::default();
+        native.add_snapshot(
+            "device".into(),
+            Snapshot::new_from_owned_state(vec![7_u64, 11]),
+        );
+        let mut persisted = Snapshot::default();
+        persisted.add_snapshot(
+            "device".into(),
+            Snapshot::new_from_state(&vec![7_u64, 11]).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(&native).unwrap(),
+            serde_json::to_value(&persisted).unwrap()
+        );
+        let mut first: Vec<u64> = owned_state_from_id(Some(&native), "device")
+            .unwrap()
+            .unwrap();
+        first[0] = 99;
+        assert_eq!(
+            owned_state_from_id::<Vec<u64>>(Some(&native), "device").unwrap(),
+            Some(vec![7, 11])
+        );
+        assert_eq!(
+            owned_state_from_id::<Vec<u64>>(Some(&persisted), "device").unwrap(),
+            Some(vec![7, 11])
+        );
+        assert_eq!(
+            owned_state_from_id::<Vec<u64>>(Some(&native), "missing").unwrap(),
+            None
+        );
+        assert!(Snapshot::default().to_owned_state::<Vec<u64>>().is_err());
+    }
+
+    #[test]
+    fn owned_state_can_be_serialized_concurrently() {
+        let snapshot = SnapshotData::new_from_owned_state(vec![42_u64; 1024]);
+        std::thread::scope(|scope| {
+            let threads = (0..8)
+                .map(|_| scope.spawn(|| serde_json::to_string(&snapshot).unwrap()))
+                .collect::<Vec<_>>();
+            let expected = serde_json::to_string(&snapshot).unwrap();
+            for thread in threads {
+                assert_eq!(thread.join().unwrap(), expected);
+            }
+        });
     }
 }

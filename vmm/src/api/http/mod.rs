@@ -10,7 +10,7 @@ use std::os::unix::io::{AsFd, IntoRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, channel};
 use std::{panic, result, thread};
 
 use log::{error, info};
@@ -31,9 +31,9 @@ use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCancelMigration, VmCounters,
-    VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice,
-    VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown,
-    VmSnapshot,
+    VmDelete, VmFork, VmForkStatus, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot,
 };
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
@@ -97,6 +97,11 @@ impl HttpError {
 
 /// Maps an [`ApiError`] to an HTTP [`StatusCode`].
 fn api_error_status_code(error: &ApiError) -> StatusCode {
+    // Requests already queued on the old HTTP server can outlive a VMM fork
+    // transition. Tell clients to reconnect instead of reporting a VM failure.
+    if matches!(error, ApiError::RequestSend(_) | ApiError::ResponseRecv(_)) {
+        return StatusCode::ServiceUnavailable;
+    }
     let source = error.source();
 
     // The migration endpoints report state conflicts with a `MigratableError`,
@@ -115,10 +120,12 @@ fn api_error_status_code(error: &ApiError) -> StatusCode {
             | VmError::DeviceManager(DeviceManagerError::UnknownDeviceId(_)),
         ) => StatusCode::NotFound,
         Some(
-            VmError::VmMigrating
+            VmError::ForkBusy
+            | VmError::VmMigrating
             | VmError::VmRestoring
             | VmError::DeviceManager(DeviceManagerError::IdentifierNotUnique(_)),
         ) => StatusCode::Conflict,
+        Some(VmError::ForkUnsupported(_)) => StatusCode::BadRequest,
         Some(VmError::ConfigValidation(e)) => match e {
             ValidationError::IdentifierNotUnique(_) | ValidationError::DuplicateDevicePath(_) => {
                 StatusCode::Conflict
@@ -336,6 +343,14 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         Box::new(VmActionHandler::new(&VmShutdown)),
     );
     r.routes.insert(
+        endpoint!("/vm.fork-status"),
+        Box::new(VmActionHandler::new(&VmForkStatus)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.fork"),
+        Box::new(VmActionHandler::new(&VmFork)),
+    );
+    r.routes.insert(
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(&VmSnapshot)),
     );
@@ -394,6 +409,7 @@ fn start_http_thread(
         .add_kill_switch(api_shutdown_fd_clone)
         .map_err(VmmError::CreateApiServer)?;
 
+    let (startup_sender, startup_receiver) = channel();
     let thread = thread::Builder::new()
         .name("http-server".to_string())
         .spawn(move || {
@@ -420,8 +436,11 @@ fn start_http_thread(
                     })?;
             }
 
+            server.start_server().map_err(VmmError::CreateApiServer)?;
+            // A bound listener alone is not sufficient: report readiness only
+            // after seccomp, landlock and server/epoll initialization succeed.
+            let _ = startup_sender.send(());
             panic::catch_unwind(AssertUnwindSafe(move || {
-                server.start_server().unwrap();
                 loop {
                     match server.requests() {
                         Ok(request_vec) => {
@@ -453,6 +472,12 @@ fn start_http_thread(
         })
         .map_err(VmmError::HttpThreadSpawn)?;
 
+    if let Err(error) = startup_receiver.recv() {
+        return match thread.join().map_err(VmmError::ThreadCleanup)? {
+            Err(error) => Err(error),
+            Ok(()) => Err(VmmError::HttpStartup(error)),
+        };
+    }
     Ok((thread, api_shutdown_fd, locked_listener))
 }
 
@@ -609,6 +634,10 @@ mod tests {
     #[test]
     fn test_state_conflicts_map_to_conflict() {
         assert_eq!(
+            api_error_status_code(&ApiError::VmFork(VmError::ForkBusy)),
+            StatusCode::Conflict
+        );
+        assert_eq!(
             api_error_status_code(&ApiError::VmmShutdown(VmError::VmMigrating)),
             StatusCode::Conflict
         );
@@ -641,6 +670,14 @@ mod tests {
                 "test"
             )))),
             StatusCode::InternalServerError
+        );
+    }
+    #[test]
+    fn test_closed_api_channel_requests_reconnect() {
+        use std::sync::mpsc::RecvError;
+        assert_eq!(
+            api_error_status_code(&ApiError::ResponseRecv(RecvError)),
+            StatusCode::ServiceUnavailable
         );
     }
 }

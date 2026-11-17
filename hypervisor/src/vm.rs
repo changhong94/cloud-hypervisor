@@ -321,6 +321,17 @@ pub enum MemoryVisibility {
 /// This crate provides a hypervisor-agnostic interfaces for Vm
 ///
 pub trait Vm: Send + Sync + Any {
+    fn supports_fork_reuse(&self) -> bool {
+        false
+    }
+    /// Takes exclusive, stopped vCPUs with all old VmOps references removed.
+    fn park_fork_vcpus(&self, _cpus: Vec<(u32, Box<dyn Vcpu>)>) -> std::io::Result<()> {
+        Err(std::io::Error::other("VM reuse is unsupported"))
+    }
+    fn fork_raw_fds(&self) -> Vec<std::os::fd::RawFd> {
+        Vec::new()
+    }
+
     #[cfg(target_arch = "x86_64")]
     /// Sets the address of the one-page region in the VM's address space.
     fn set_identity_map_address(&self, address: u64) -> Result<()>;

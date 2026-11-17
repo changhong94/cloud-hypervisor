@@ -6,6 +6,7 @@ use std::fs::{File, Metadata};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::{io, ptr};
 
 use vmm_sys_util::file_traits::FileSync;
@@ -14,6 +15,30 @@ use vmm_sys_util::write_zeroes::{PunchHole, WriteZeroesAt};
 
 use crate::aligned_buffer::AlignedBuffer;
 use crate::{SECTOR_SIZE, probe_direct_alignment};
+
+// Opt-in slow-sync diagnostics; the durability operation is unchanged.
+fn trace_sync(
+    file: &File,
+    operation: &str,
+    sync: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if std::env::var_os("CH_FORK_TIMING").is_none() {
+        return sync();
+    }
+    let start = std::time::Instant::now();
+    let result = sync();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    if elapsed >= 100.0 {
+        use std::io::Write;
+        let line = format!(
+            "VM_FORK disk_sync pid={} fd={} operation={operation} elapsed_ms={elapsed:.3}\n",
+            std::process::id(),
+            file.as_raw_fd()
+        );
+        let _ = io::stderr().lock().write_all(line.as_bytes());
+    }
+    result
+}
 
 /// True when `buf_ptr`/`len`/`offset` already satisfy `alignment`
 /// (`None` means no O_DIRECT, so everything is "aligned").
@@ -46,6 +71,9 @@ fn iovecs_are_aligned(alignment: Option<usize>, iovecs: &[libc::iovec], offset: 
 pub struct AlignedFile {
     file: File,
     alignment: Option<usize>,
+    // Only used while parsing a freshly created, identity-checked fork leaf.
+    // Removed before the disk becomes writable or any data queue is created.
+    initial_read_cache: Option<Arc<[u8]>>,
 }
 
 impl AlignedFile {
@@ -56,7 +84,15 @@ impl AlignedFile {
         } else {
             None
         };
-        AlignedFile { file, alignment }
+        AlignedFile {
+            file,
+            alignment,
+            initial_read_cache: None,
+        }
+    }
+
+    pub(crate) fn set_initial_read_cache(&mut self, cache: Option<Arc<[u8]>>) {
+        self.initial_read_cache = cache;
     }
 
     pub fn alignment(&self) -> Option<usize> {
@@ -75,6 +111,7 @@ impl AlignedFile {
         Ok(AlignedFile {
             file: self.file.try_clone()?,
             alignment: self.alignment,
+            initial_read_cache: self.initial_read_cache.clone(),
         })
     }
 
@@ -87,11 +124,11 @@ impl AlignedFile {
     }
 
     pub fn sync_all(&self) -> io::Result<()> {
-        self.file.sync_all()
+        trace_sync(&self.file, "sync_all", || self.file.sync_all())
     }
 
     pub fn sync_data(&self) -> io::Result<()> {
-        self.file.sync_data()
+        trace_sync(&self.file, "sync_data", || self.file.sync_data())
     }
 
     pub fn is_direct(&self) -> bool {
@@ -112,7 +149,11 @@ impl AlignedFile {
     /// tests to force the bounce/RMW path without a real O_DIRECT fd.
     #[cfg(test)]
     pub fn with_alignment(file: File, alignment: Option<usize>) -> Self {
-        AlignedFile { file, alignment }
+        AlignedFile {
+            file,
+            alignment,
+            initial_read_cache: None,
+        }
     }
 
     /// Read `len` bytes at `offset` through an aligned bounce buffer.
@@ -237,6 +278,14 @@ impl AlignedFile {
 
 impl FileExt for AlignedFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        if let Some(cache) = &self.initial_read_cache
+            && offset < cache.len() as u64
+        {
+            let start = offset as usize;
+            let count = buf.len().min(cache.len() - start);
+            buf[..count].copy_from_slice(&cache[start..start + count]);
+            return Ok(count);
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -250,6 +299,9 @@ impl FileExt for AlignedFile {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        if self.initial_read_cache.is_some() {
+            return Err(io::Error::other("Cannot write cached QCOW parser input"));
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -277,7 +329,7 @@ impl PunchHole for AlignedFile {
 
 impl FileSync for AlignedFile {
     fn fsync(&mut self) -> io::Result<()> {
-        self.file.fsync()
+        trace_sync(&self.file, "fsync", || self.file.sync_all())
     }
 }
 
@@ -327,7 +379,11 @@ mod tests {
     }
 
     fn forced(file: File, alignment: Option<usize>) -> AlignedFile {
-        AlignedFile { file, alignment }
+        AlignedFile {
+            file,
+            alignment,
+            initial_read_cache: None,
+        }
     }
 
     #[test]

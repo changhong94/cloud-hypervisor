@@ -4,6 +4,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::env::consts;
 
 use hypervisor::HypervisorType;
@@ -36,6 +37,8 @@ use crate::userfaultfd::{
 #[derive(Copy, Clone)]
 pub enum Thread {
     Main,
+    ForkSupervisor,
+    ForkVmm,
     HttpApi,
     #[cfg(feature = "dbus_api")]
     DBusApi,
@@ -594,6 +597,15 @@ fn common_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
     Ok(vec![
         (libc::SYS_getpid, vec![]),
         (libc::SYS_gettid, vec![]),
+        (
+            libc::SYS_getrusage,
+            or![and![Cond::new(
+                0,
+                ArgLen::Dword,
+                Eq,
+                libc::RUSAGE_THREAD as _
+            )?]],
+        ),
         (libc::SYS_read, vec![]),
         (libc::SYS_rt_sigaction, vec![]),
         (libc::SYS_rt_sigprocmask, vec![]),
@@ -771,6 +783,8 @@ fn vmm_thread_rules(
         (libc::SYS_futex, vec![]),
         (libc::SYS_getcwd, vec![]),
         (libc::SYS_getdents64, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_lstat, vec![]),
         (libc::SYS_getpgid, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_getpgrp, vec![]),
@@ -1306,6 +1320,23 @@ fn get_seccomp_rules(
     let mut rules = common_thread_rules()?;
     let specific_rules = match thread_type {
         Thread::Main => main_thread_rules()?,
+        Thread::ForkSupervisor => fork_supervisor_rules(hypervisor_type.unwrap())?,
+        Thread::ForkVmm => {
+            let mut rules = vmm_thread_rules(hypervisor_type.unwrap())?;
+            // Only explicit fork mode prepares new disk directories/history
+            // links before pausing. Sealing/rename/setns stay supervisor-only.
+            rules.extend([
+                (libc::SYS_mkdirat, vec![]),
+                (libc::SYS_linkat, vec![]),
+                #[cfg(target_arch = "x86_64")]
+                (libc::SYS_mkdir, vec![]),
+                #[cfg(target_arch = "x86_64")]
+                (libc::SYS_link, vec![]),
+                #[cfg(target_arch = "x86_64")]
+                (libc::SYS_rmdir, vec![]),
+            ]);
+            rules
+        }
         Thread::HttpApi => http_api_thread_rules()?,
         #[cfg(feature = "dbus_api")]
         Thread::DBusApi => dbus_api_thread_rules()?,
@@ -1357,6 +1388,129 @@ fn get_seccomp_rules(
     Ok(rules)
 }
 
+// A supervisor must be able to spawn workers after fork. Its inherited filter
+// is the union of existing worker policies; each worker still installs its own
+// narrower policy. Merge OR conditions rather than overwriting duplicate keys.
+fn fork_supervisor_rules(
+    hypervisor: HypervisorType,
+) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    let mut merged: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    let mut add = |rules: Vec<(i64, Vec<SeccompRule>)>| {
+        for (syscall, conditions) in rules {
+            merged
+                .entry(syscall)
+                .and_modify(|old| {
+                    if old.is_empty() || conditions.is_empty() {
+                        old.clear();
+                    } else {
+                        old.extend(conditions.clone());
+                    }
+                })
+                .or_insert(conditions);
+        }
+    };
+    // Migration workers inherit VMM's policy, including its restricted ioctl
+    // set. Their own unconditional ioctl rule must not widen the supervisor.
+    for role in [
+        Thread::Main,
+        Thread::Vmm,
+        Thread::Vcpu,
+        Thread::HttpApi,
+        Thread::SignalHandler,
+        Thread::SerialManager,
+        Thread::PtyForeground,
+    ] {
+        add(get_seccomp_rules(role, Some(hypervisor))?);
+    }
+    use virtio_devices::seccomp_filters::{self as virtio, Thread as DeviceThread};
+    for role in [
+        DeviceThread::VirtioBalloon,
+        DeviceThread::VirtioBlock,
+        DeviceThread::VirtioConsole,
+        DeviceThread::VirtioIommu,
+        DeviceThread::VirtioMem,
+        DeviceThread::VirtioNet,
+        DeviceThread::VirtioNetCtl,
+        DeviceThread::VirtioPmem,
+        DeviceThread::VirtioRng,
+        DeviceThread::VirtioRtc,
+        DeviceThread::VirtioVhostBlock,
+        DeviceThread::VirtioVhostFs,
+        DeviceThread::VirtioGenericVhostUser,
+        DeviceThread::VirtioVhostNet,
+        DeviceThread::VirtioVhostNetCtl,
+        DeviceThread::VirtioVsock,
+        DeviceThread::VirtioWatchdog,
+    ] {
+        add(virtio::get_seccomp_rules(role));
+    }
+    // Only the calling supervisor may adjust scheduling around host fork.
+    // Device/vCPU/VMM filters still reject these scheduling mutations.
+    add(vec![
+        (
+            libc::SYS_sched_getscheduler,
+            or![and![Cond::new(0, ArgLen::Dword, Eq, 0)?]],
+        ),
+        (
+            libc::SYS_getpriority,
+            or![and![
+                Cond::new(0, ArgLen::Dword, Eq, libc::PRIO_PROCESS as u64)?,
+                Cond::new(1, ArgLen::Dword, Eq, 0)?
+            ]],
+        ),
+        (
+            libc::SYS_sched_setscheduler,
+            or![
+                and![
+                    Cond::new(0, ArgLen::Dword, Eq, 0)?,
+                    Cond::new(1, ArgLen::Dword, Eq, libc::SCHED_OTHER as u64)?
+                ],
+                and![
+                    Cond::new(0, ArgLen::Dword, Eq, 0)?,
+                    Cond::new(
+                        1,
+                        ArgLen::Dword,
+                        Eq,
+                        (libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK) as u64
+                    )?
+                ],
+            ],
+        ),
+    ]);
+    // The supervisor and its disk merge worker create/seal CoW histories.
+    // VMM/API/device policies do not gain filesystem mutation permissions.
+    add(vec![
+        (libc::SYS_renameat, vec![]),
+        (libc::SYS_renameat2, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_rename, vec![]),
+        (libc::SYS_mkdirat, vec![]),
+        (libc::SYS_linkat, vec![]),
+        (libc::SYS_fchmodat, vec![]),
+        (libc::SYS_unlinkat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_mkdir, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_link, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_chmod, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_rmdir, vec![]),
+    ]);
+    // Only the single-threaded fork supervisor changes network namespaces.
+    // Device/VMM workers retain their narrower filters without setns.
+    add(vec![(
+        libc::SYS_setns,
+        vec![and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            libc::CLONE_NEWNET as u64
+        )?]],
+    )]);
+    Ok(merged.into_iter().collect())
+}
+
 /// Generate a BPF program based on the seccomp_action value
 pub fn get_seccomp_filter(
     seccomp_action: &SeccompAction,
@@ -1376,5 +1530,79 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(all(test, feature = "kvm", target_arch = "x86_64"))]
+mod fork_tests {
+    use super::*;
+
+    #[test]
+    fn fork_vmm_preparation_does_not_gain_supervisor_operations() {
+        let rules: BTreeMap<_, _> = get_seccomp_rules(Thread::ForkVmm, Some(HypervisorType::Kvm))
+            .unwrap()
+            .into_iter()
+            .collect();
+        for syscall in [libc::SYS_mkdir, libc::SYS_link, libc::SYS_rmdir] {
+            assert!(rules.contains_key(&syscall));
+        }
+        for syscall in [
+            libc::SYS_chmod,
+            libc::SYS_rename,
+            libc::SYS_setns,
+            libc::SYS_execve,
+            libc::SYS_ptrace,
+        ] {
+            assert!(!rules.contains_key(&syscall));
+        }
+        assert!(!rules[&libc::SYS_ioctl].is_empty());
+    }
+
+    #[test]
+    fn supervisor_is_bounded_and_retains_ioctl_argument_filtering() {
+        let rules: BTreeMap<_, _> = fork_supervisor_rules(HypervisorType::Kvm)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!rules.contains_key(&libc::SYS_execve));
+        assert!(!rules.contains_key(&libc::SYS_ptrace));
+        assert!(!rules.contains_key(&libc::SYS_mount));
+        assert!(!rules[&libc::SYS_ioctl].is_empty());
+        assert!(!rules[&libc::SYS_setns].is_empty());
+        let filter = get_seccomp_filter(
+            &SeccompAction::Trap,
+            Thread::ForkSupervisor,
+            Some(HypervisorType::Kvm),
+        )
+        .unwrap();
+        assert!(!filter.is_empty() && filter.len() < 4096);
+        // The ordinary main policy remains unable to spawn new threads.
+        let main: BTreeMap<_, _> = get_seccomp_rules(Thread::Main, None)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!main.contains_key(&libc::SYS_clone));
+        assert!(!main.contains_key(&libc::SYS_setns));
+        let vmm: BTreeMap<_, _> = get_seccomp_rules(Thread::Vmm, Some(HypervisorType::Kvm))
+            .unwrap()
+            .into_iter()
+            .collect();
+        for syscall in [
+            libc::SYS_sched_getscheduler,
+            libc::SYS_getpriority,
+            libc::SYS_sched_setscheduler,
+        ] {
+            assert!(!rules[&syscall].is_empty());
+            assert!(!vmm.contains_key(&syscall));
+        }
+        for syscall in [
+            libc::SYS_mkdir,
+            libc::SYS_link,
+            libc::SYS_chmod,
+            libc::SYS_rename,
+        ] {
+            assert!(rules.contains_key(&syscall));
+            assert!(!vmm.contains_key(&syscall));
+        }
     }
 }
