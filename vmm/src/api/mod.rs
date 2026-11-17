@@ -58,6 +58,7 @@ use crate::config::{
     RestoreConfig, RestoredVfioConfig, VmMemoryZoneUpdateData, deserialize_restored_fd,
 };
 use crate::device_tree::DeviceTree;
+use crate::fork::ForkOperation;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
@@ -70,6 +71,8 @@ use crate::vm_config::{
 /// API errors are sent back from the VMM API server through the ApiResponse.
 #[derive(Error, Debug)]
 pub enum ApiError {
+    #[error("The VM could not be forked")]
+    VmFork(#[source] VmError),
     /// Cannot write to EventFd.
     #[error("Cannot write to EventFd")]
     EventFdWrite(#[source] io::Error),
@@ -884,6 +887,15 @@ pub enum ApiResponsePayload {
 pub type ApiResponse = Result<ApiResponsePayload, ApiError>;
 
 pub trait RequestHandler {
+    fn vm_fork_status(&mut self) -> Vec<ForkOperation> {
+        Vec::new()
+    }
+    fn vm_fork(&mut self, _config: VmForkConfig) -> Result<ForkOperation, VmError> {
+        Err(VmError::ForkUnsupported(
+            "Fork supervisor is unavailable".into(),
+        ))
+    }
+
     fn vm_create(&mut self, config: Box<VmConfig>) -> Result<(), VmError>;
 
     fn vm_boot(&mut self) -> Result<(), VmError>;
@@ -1418,6 +1430,38 @@ impl ApiAction for VmCoredump {
                 .vm_coredump(&coredump_data.destination_url)
                 .map_err(ApiError::VmCoredump)
                 .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmForkStatus;
+
+impl ApiAction for VmForkStatus {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            debug!("API request event: VmForkStatus");
+
+            let response = Ok(ApiResponsePayload::VmAction(Some(
+                serde_json::to_vec(&vmm.vm_fork_status()).unwrap(),
+            )));
 
             response_sender
                 .send(response)
@@ -2069,6 +2113,60 @@ impl ApiAction for VmShutdown {
         data: Self::RequestBody,
     ) -> ApiResult<Self::ResponseBody> {
         get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+/// Accepted fork requests stop and rebuild both API services. Poll the child
+/// socket's vm.info endpoint for completion; the HTTP acknowledgement is not
+/// a guarantee that host fork or child restore succeeded.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmForkConfig {
+    #[serde(default)]
+    pub parent_disk_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub child_disk_dir: Option<PathBuf>,
+    pub child_api_socket: PathBuf,
+    pub child_serial_socket: PathBuf,
+    #[serde(default)]
+    pub child_vsock: Option<crate::vm_config::VsockConfig>,
+    #[serde(default)]
+    pub child_net: Option<crate::vm_config::NetConfig>,
+    #[serde(default)]
+    pub child_netns: Option<PathBuf>,
+}
+
+pub struct VmFork;
+
+impl ApiAction for VmFork {
+    type RequestBody = VmForkConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, config: Self::RequestBody, sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            let result = vmm.vm_fork(config).map_err(ApiError::VmFork);
+            let accepted = result.is_ok();
+            if sender
+                .send(result.map(|operation| {
+                    ApiResponsePayload::VmAction(Some(serde_json::to_vec(&operation).unwrap()))
+                }))
+                .is_err()
+            {
+                // Once accepted, the VM runtime has been torn down. A client
+                // disconnect must not discard the pending parent restoration.
+                warn!("VM fork response receiver disconnected");
+            }
+            Ok(accepted)
+        })
+    }
+
+    fn send(
+        &self,
+        evt: EventFd,
+        sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, evt, sender, data)
     }
 }
 

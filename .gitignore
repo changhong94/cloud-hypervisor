@@ -11,3 +11,7 @@
 /target
 /vendor
 __pycache__
+
+# Generated Python bytecode from research tools.
+__pycache__/
+*.pyc

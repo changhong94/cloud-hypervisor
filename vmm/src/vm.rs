@@ -78,10 +78,8 @@ use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::Bus;
 #[cfg(feature = "tdx")]
-use vm_memory::GuestMemoryBackend;
-#[cfg(feature = "tdx")]
 use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
@@ -127,6 +125,10 @@ use crate::{
 /// Errors associated with VM management
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("A VM fork operation is still pending")]
+    ForkBusy,
+    #[error("VM fork is unsupported: {0}")]
+    ForkUnsupported(String),
     #[error("Cannot open kernel file")]
     KernelFile(#[source] io::Error),
 
@@ -546,18 +548,32 @@ pub struct Vm {
     initramfs: Option<File>,
     threads: Vec<thread::JoinHandle<()>>,
     device_manager: Arc<Mutex<DeviceManager>>,
+    _after_device_manager: crate::fork::DropTrace,
     config: Arc<Mutex<VmConfig>>,
     state: VmState,
+    fork_cpu_shutdown: bool,
     cpu_manager: Arc<Mutex<cpu::CpuManager>>,
+    _after_cpu_manager: crate::fork::DropTrace,
     memory_manager: Arc<Mutex<MemoryManager>>,
+    _after_memory_manager: crate::fork::DropTrace,
     #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
     // The hypervisor abstracted virtual machine.
     vm: Arc<dyn hypervisor::Vm>,
+    _after_vm: crate::fork::DropTrace,
     saved_clock: Option<SavedClock>,
     #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
+}
+
+/// Field order matters: retain the slot's userspace mapping through KVM VM
+/// destruction. No vCPU, device worker, or writable disk is retained here.
+pub(crate) struct RetiredForkVm {
+    _vm: Arc<dyn hypervisor::Vm>,
+    _after_vm: crate::fork::DropTrace,
+    #[cfg(not(target_arch = "riscv64"))]
+    _vmgenid: Option<vm_device::UserspaceMapping>,
 }
 
 impl Drop for Vm {
@@ -571,6 +587,51 @@ impl Drop for Vm {
 
 impl Vm {
     pub const HANDLED_SIGNALS: [i32; 1] = [SIGWINCH];
+
+    pub(crate) fn prepare_fork_backings(
+        &self,
+    ) -> std::io::Result<Vec<block::formats::qcow::PreparedQcowBacking>> {
+        self.device_manager.lock().unwrap().prepare_fork_backings()
+    }
+
+    pub(crate) fn preflush_fork_disks(&self) -> std::io::Result<()> {
+        self.device_manager.lock().unwrap().preflush_fork_disks()
+    }
+
+    pub(crate) fn fork_reusable_vm(&self) -> Option<Arc<dyn hypervisor::Vm>> {
+        self.vm.supports_fork_reuse().then(|| Arc::clone(&self.vm))
+    }
+    pub(crate) fn detach_fork_events(&self) -> std::io::Result<()> {
+        self.device_manager.lock().unwrap().detach_fork_events()
+    }
+
+    pub(crate) fn retain_fork_disks(&self) -> Vec<Box<dyn block::disk_file::ForkRetirement>> {
+        self.device_manager.lock().unwrap().retain_fork_disks()
+    }
+
+    /// After successful capture, the fork coordinator joins these paused CPU
+    /// threads in parallel with dropping the device graph. No resume is allowed
+    /// after this teardown commit; normal pause/snapshot failure paths never
+    /// call this method.
+    pub(crate) fn retain_fork_cpu_threads(&mut self) -> Arc<Mutex<cpu::CpuManager>> {
+        assert_eq!(self.state, VmState::Paused);
+        self.fork_cpu_shutdown = true;
+        Arc::clone(&self.cpu_manager)
+    }
+
+    /// Called only after successful capture of a paused, validated fork VM.
+    pub(crate) fn retain_fork_vm(&mut self) -> Arc<RetiredForkVm> {
+        Arc::new(RetiredForkVm {
+            _vm: Arc::clone(&self.vm),
+            _after_vm: crate::fork::DropTrace("retired_kvm_closed"),
+            #[cfg(not(target_arch = "riscv64"))]
+            _vmgenid: self
+                .device_manager
+                .lock()
+                .unwrap()
+                .take_fork_vmgenid_mapping(),
+        })
+    }
 
     #[cfg(feature = "sev_snp")]
     pub fn get_default_sev_snp_guest_policy() -> SnpPolicy {
@@ -650,6 +711,7 @@ impl Vm {
             &numa_nodes,
         )?;
 
+        crate::fork::trace_point("cpu_manager_created");
         // Perform hypervisor-specific TDX initialization if enabled
         #[cfg(feature = "tdx")]
         Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
@@ -675,6 +737,7 @@ impl Vm {
             snapshot,
         )?;
 
+        crate::fork::trace_point("devices_created");
         // Perform hypervisor-specific initialization
         let load_payload_handle = Self::hypervisor_specific_init(
             &vm,
@@ -691,6 +754,7 @@ impl Vm {
             igvm_file,
         )?;
 
+        crate::fork::trace_point("device_state_restored");
         // Load files needed directly by the VMM.
         #[cfg(feature = "tdx")]
         let kernel = config
@@ -736,12 +800,17 @@ impl Vm {
             kernel,
             initramfs,
             device_manager,
+            _after_device_manager: crate::fork::DropTrace("device_manager_dropped"),
             config,
             threads: Vec::with_capacity(1),
             state,
             cpu_manager,
+            fork_cpu_shutdown: false,
+            _after_cpu_manager: crate::fork::DropTrace("cpu_manager_dropped"),
             memory_manager,
+            _after_memory_manager: crate::fork::DropTrace("memory_manager_dropped"),
             vm,
+            _after_vm: crate::fork::DropTrace("kvm_vm_dropped"),
             saved_clock,
             #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
@@ -994,6 +1063,7 @@ impl Vm {
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
 
+        crate::fork::trace_point("cpu_state_restored");
         // KVM-specific initialization
         #[cfg(feature = "kvm")]
         if is_kvm {
@@ -1365,7 +1435,65 @@ impl Vm {
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
     ) -> Result<Self> {
+        Self::new_with_inherited_memory(
+            vm_config,
+            exit_evt,
+            reset_evt,
+            guest_exit_evt,
+            #[cfg(feature = "guest_debug")]
+            vm_debug_evt,
+            seccomp_action,
+            hypervisor,
+            activate_evt,
+            console_info,
+            console_resize_pipe,
+            original_termios,
+            snapshot,
+            source_url,
+            prefault,
+            memory_restore_mode,
+            None,
+            None,
+        )
+    }
+
+    /// Rebuild a VM using RAM mappings retained across a host process fork.
+    /// All old userspace workers must be joined. Only the owning parent may
+    /// supply its retained KVM with detached eventfds and stopped vCPUs.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_with_inherited_memory(
+        vm_config: Arc<Mutex<VmConfig>>,
+        exit_evt: EventFd,
+        reset_evt: EventFd,
+        guest_exit_evt: EventFd,
+        #[cfg(feature = "guest_debug")] vm_debug_evt: EventFd,
+        seccomp_action: &SeccompAction,
+        hypervisor: Arc<dyn hypervisor::Hypervisor>,
+        activate_evt: EventFd,
+        console_info: Option<ConsoleInfo>,
+        console_resize_pipe: Option<Arc<File>>,
+        original_termios: Arc<Mutex<Option<termios>>>,
+        snapshot: Option<&Snapshot>,
+        source_url: Option<&str>,
+        prefault: Option<bool>,
+        memory_restore_mode: Option<MemoryRestoreMode>,
+        inherited_memory: Option<&GuestMemoryMmap>,
+        reused_vm: Option<Arc<dyn hypervisor::Vm>>,
+    ) -> Result<Self> {
         trace_scoped!("Vm::new");
+
+        if let Some(memory) = inherited_memory
+            && (snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID).is_none()
+                || source_url.is_some()
+                || !is_restore_cow_supported(&vm_config.lock().unwrap())
+                || memory
+                    .iter()
+                    .any(|region| region.flags() & libc::MAP_SHARED != 0))
+        {
+            return Err(Error::Restore(MigratableError::Restore(anyhow!(
+                "Inherited RAM requires an in-memory snapshot and private, non-resizable memory"
+            ))));
+        }
 
         #[cfg(not(target_arch = "riscv64"))]
         let timestamp = Instant::now();
@@ -1389,13 +1517,24 @@ impl Vm {
                 .map_err(Error::IgvmLoad)?
         };
 
-        let vm = {
+        let reusing = reused_vm.is_some();
+        let vm = if let Some(vm) = reused_vm {
+            crate::fork::trace_point("parent_kvm_reused");
+            vm
+        } else {
             #[allow(unused_mut)]
             let mut hv_config: hypervisor::HypervisorVmConfig =
                 vm_config.as_ref().lock().unwrap().deref().into();
             #[cfg(feature = "sev_snp")]
             if let Some(ref igvm) = igvm_file {
                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
+            }
+            // Fork families commonly oversubscribe the host. A halted vCPU
+            // should yield its CPU instead of spending a polling budget that
+            // competes with another branch's restore and control-plane work.
+            // This is per VM: leave host-wide settings and normal boots alone.
+            if inherited_memory.is_some() {
+                hv_config.halt_poll_ns = Some(0);
             }
             Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
         };
@@ -1405,6 +1544,9 @@ impl Vm {
             vm.enable_x2apic_api().unwrap();
         }
 
+        if !reusing {
+            crate::fork::trace_point("kvm_created");
+        }
         let phys_bits = physical_bits(
             hypervisor.as_ref(),
             vm_config.lock().unwrap().cpus.max_phys_bits,
@@ -1422,17 +1564,41 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
-                MemoryManager::new_from_snapshot(
-                    snapshot,
-                    Arc::clone(&vm),
-                    &vm_config.lock().unwrap().memory.clone(),
-                    source_url,
-                    prefault.unwrap_or(false),
-                    memory_restore_mode,
-                    phys_bits,
-                    &exit_evt,
-                )
-                .map_err(Error::MemoryManager)?
+                if let Some(memory) = inherited_memory {
+                    let data = snapshot.to_state().map_err(Error::Restore)?;
+                    let manager = MemoryManager::new_with_inherited_memory(
+                        Arc::clone(&vm),
+                        &vm_config.lock().unwrap().memory,
+                        Some(false),
+                        phys_bits,
+                        #[cfg(feature = "tdx")]
+                        false,
+                        Some(&data),
+                        Default::default(),
+                        Some(memory),
+                    )
+                    .map_err(Error::MemoryManager)?;
+                    if reusing {
+                        manager
+                            .lock()
+                            .unwrap()
+                            .retain_fork_ram_slots(&data)
+                            .map_err(Error::MemoryManager)?;
+                    }
+                    manager
+                } else {
+                    MemoryManager::new_from_snapshot(
+                        snapshot,
+                        Arc::clone(&vm),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        source_url,
+                        prefault.unwrap_or(false),
+                        memory_restore_mode,
+                        phys_bits,
+                        &exit_evt,
+                    )
+                    .map_err(Error::MemoryManager)?
+                }
             } else {
                 MemoryManager::new(
                     Arc::clone(&vm),
@@ -1447,6 +1613,7 @@ impl Vm {
                 .map_err(Error::MemoryManager)?
             };
 
+        crate::fork::trace_point("memory_registered");
         Vm::new_from_memory_manager(
             vm_config,
             memory_manager,
@@ -1474,9 +1641,12 @@ impl Vm {
         hypervisor: &dyn hypervisor::Hypervisor,
         config: HypervisorVmConfig,
     ) -> Result<Arc<dyn hypervisor::Vm>> {
+        crate::fork::trace_point("kvm_extensions_begin");
         hypervisor.check_required_extensions().unwrap();
+        crate::fork::trace_point("kvm_extensions_done");
 
         let vm = hypervisor.create_vm(config).unwrap();
+        crate::fork::trace_point("kvm_vm_object_created");
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -2061,14 +2231,16 @@ impl Vm {
             return;
         }
 
-        if let Err(e) = self.cpu_manager.lock().unwrap().shutdown() {
-            error!(
-                "FATAL: Failed stopping vCPUs during shutdown: {}",
-                flatten_error_chain_to_string(&e)
-            );
-            exit(1);
+        if !self.fork_cpu_shutdown {
+            if let Err(e) = self.cpu_manager.lock().unwrap().shutdown() {
+                error!(
+                    "FATAL: Failed stopping vCPUs during shutdown: {}",
+                    flatten_error_chain_to_string(&e)
+                );
+                exit(1);
+            }
+            crate::fork::trace_point("vcpu_threads_joined");
         }
-
         // Wait for all the threads to finish
         for thread in self.threads.drain(..) {
             if let Err(e) = thread.join() {
@@ -2076,6 +2248,7 @@ impl Vm {
                 exit(1);
             }
         }
+        crate::fork::trace_point("vm_aux_threads_joined");
         self.state = VmState::Shutdown;
     }
 
@@ -3321,11 +3494,14 @@ impl Pausable for Vm {
         })?;
 
         self.cpu_manager.lock().unwrap().pause()?;
+        crate::fork::trace_point("vcpus_paused");
 
         // Capture the guest clock now that the vCPUs are quiesced.
         self.saved_clock = self.capture_guest_clock()?;
+        crate::fork::trace_point("guest_clock_captured");
 
         self.device_manager.lock().unwrap().pause()?;
+        crate::fork::trace_point("devices_paused");
 
         self.vm
             .pause()
@@ -3417,17 +3593,20 @@ impl Snapshottable for Vm {
             (cpu_manager.id(), cpu_manager.snapshot()?)
         };
         vm_snapshot.add_snapshot(id, snapshot);
+        crate::fork::trace_point("cpu_state_captured");
         let (id, snapshot) = {
             let mut memory_manager = self.memory_manager.lock().unwrap();
             (memory_manager.id(), memory_manager.snapshot()?)
         };
         vm_snapshot.add_snapshot(id, snapshot);
+        crate::fork::trace_point("memory_state_captured");
         let (id, snapshot) = {
             let mut device_manager = self.device_manager.lock().unwrap();
             (device_manager.id(), device_manager.snapshot()?)
         };
         vm_snapshot.add_snapshot(id, snapshot);
 
+        crate::fork::trace_point("device_state_captured");
         event!("vm", "snapshotted");
         Ok(vm_snapshot)
     }

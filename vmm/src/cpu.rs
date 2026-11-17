@@ -17,7 +17,7 @@ use std::io::Write;
 use std::mem::zeroed;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::{any, cmp, hint, io, panic, result, thread, time};
 
 #[cfg(target_arch = "aarch64")]
@@ -701,17 +701,22 @@ impl Snapshottable for Vcpu {
             .state()
             .map_err(|e| MigratableError::Snapshot(anyhow!("Could not get vCPU state {e:?}")))?;
 
-        Ok(Snapshot::from_data(SnapshotData::new_from_state(
-            &saved_state,
-        )?))
+        Ok(Snapshot::from_data(SnapshotData::new_from_owned_state(
+            saved_state,
+        )))
     }
 }
 
 impl Vcpu {
     fn restore(&self, snapshot: &Snapshot) -> result::Result<(), MigratableError> {
-        let state: CpuState = snapshot.to_state().map_err(|e| {
-            MigratableError::Restore(anyhow!("Could not get vCPU state from snapshot {e:?}"))
-        })?;
+        let state: CpuState = snapshot
+            .snapshot_data
+            .as_ref()
+            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing vCPU snapshot data")))?
+            .to_owned_state()
+            .map_err(|e| {
+                MigratableError::Restore(anyhow!("Could not get vCPU state from snapshot {e:?}"))
+            })?;
 
         #[cfg(target_arch = "aarch64")]
         self.finalize(state.pre_finalize_regs()).map_err(|e| {
@@ -825,6 +830,34 @@ impl TryFrom<i32> for CoreSchedulingLeader {
     }
 }
 
+/// An atomic acknowledgement with a sleeping waiter. The mutex closes the
+/// check-to-sleep race; publication is never performed from a signal handler.
+#[derive(Default)]
+struct VcpuAcknowledgement {
+    value: AtomicBool,
+    lock: Mutex<()>,
+    changed: Condvar,
+}
+
+impl VcpuAcknowledgement {
+    fn store(&self, value: bool, ordering: Ordering) {
+        let _guard = self.lock.lock().unwrap();
+        self.value.store(value, ordering);
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, expected: bool, timeout: time::Duration) -> bool {
+        let guard = self.lock.lock().unwrap();
+        let _guard = self
+            .changed
+            .wait_timeout_while(guard, timeout, |_| {
+                self.value.load(Ordering::SeqCst) != expected
+            })
+            .unwrap();
+        self.value.load(Ordering::SeqCst) == expected
+    }
+}
+
 /// Management structure for a vCPU (thread).
 #[derive(Default)]
 struct VcpuState {
@@ -836,9 +869,9 @@ struct VcpuState {
     /// Instructs the thread to exit the run-vCPU loop.
     kill: Arc<AtomicBool>,
     /// Used to ACK interruption from the run vCPU loop to the CPU Manager.
-    vcpu_run_interrupted: Arc<AtomicBool>,
+    vcpu_run_interrupted: Arc<VcpuAcknowledgement>,
     /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
-    paused: Arc<AtomicBool>,
+    paused: Arc<VcpuAcknowledgement>,
 }
 
 impl VcpuState {
@@ -848,8 +881,7 @@ impl VcpuState {
 
     /// Sends a signal to the underlying thread.
     ///
-    /// Please call [`Self::wait_until_signal_acknowledged`] afterward to block
-    /// until the vCPU thread has acknowledged the signal.
+    /// The caller must wait on vcpu_run_interrupted outside the state lock.
     ///
     /// If the thread is in KVM_RUN (or MSHV_RUN_VP or equivalent), this kicks
     /// the thread out of kernel space. If the thread is in user-space, the
@@ -866,37 +898,31 @@ impl VcpuState {
         }
     }
 
-    /// Blocks until the vCPU thread has acknowledged the signal. It retries to send
-    /// the signal every 10ms. Times out after 1000ms.
-    ///
-    /// This is the counterpart of [`Self::signal_thread`].
+    // Used by targeted hot-unplug, which owns the state until the thread exits.
     fn wait_until_signal_acknowledged(&self) -> Result<()> {
-        if let Some(_handle) = self.handle.as_ref() {
-            let mut count = 0;
-            loop {
-                if self.vcpu_run_interrupted.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                // This is more effective than thread::yield_now() at
-                // avoiding a priority inversion with the vCPU thread
-                thread::sleep(time::Duration::from_millis(1));
-                count += 1;
-                if count >= 1000 {
-                    return Err(Error::SignalAcknowledgeTimeout);
-                } else if count % 10 == 0 {
-                    warn!("vCPU thread did not respond in {count}ms to signal - retrying");
-                    self.signal_thread();
-                }
-            }
+        if !self.active() {
+            return Ok(());
         }
-        Ok(())
+        let deadline = time::Instant::now() + time::Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(time::Instant::now());
+            if self
+                .vcpu_run_interrupted
+                .wait(true, remaining.min(time::Duration::from_millis(10)))
+            {
+                return Ok(());
+            }
+            if time::Instant::now() >= deadline {
+                return Err(Error::SignalAcknowledgeTimeout);
+            }
+            self.signal_thread();
+        }
     }
 
     fn join_thread(&mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
             handle.join().map_err(Error::ThreadCleanup)?;
         }
-
         Ok(())
     }
 
@@ -1696,28 +1722,74 @@ impl CpuManager {
 
     /// Signals all vCPU threads and waits for them to ACK the interruption.
     ///
-    /// Calls [`VcpuState::signal_thread`] and
-    /// [`VcpuState::wait_until_signal_acknowledged`] for each vCPU.
+    /// Signals every active vCPU before waiting for acknowledgements.
     fn signal_vcpus(&mut self) -> Result<()> {
-        let vcpu_count = self.vcpu_states.lock().unwrap().len();
+        self.signal_vcpus_with_trace(false)
+    }
 
-        // Splitting this into two loops reduced the time to pause many vCPUs
-        // massively. Example: 254 vCPUs. >254ms -> ~4ms.
-        //
-        // Do not hold `vcpu_states` across the wait phase. A vCPU can handle
-        // the kick in userspace while servicing MMIO on the ACPI CPU hotplug
-        // device, and that path also takes `vcpu_states`. Holding the mutex
-        // here while waiting would deadlock pause against that MMIO access.
-        for cpu_id in 0..vcpu_count {
-            let vcpu_states = self.vcpu_states.lock().unwrap();
-            vcpu_states[cpu_id].signal_thread();
+    fn signal_vcpus_with_trace(&mut self, trace_pause: bool) -> Result<()> {
+        let acknowledgements = {
+            let states = self.vcpu_states.lock().unwrap();
+            states
+                .iter()
+                .enumerate()
+                .filter_map(|(id, state)| {
+                    if state.active() {
+                        state.signal_thread();
+                        Some((id, Arc::clone(&state.vcpu_run_interrupted)))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        if trace_pause {
+            crate::fork::trace_point("cpu_signals_sent");
         }
-        for cpu_id in 0..vcpu_count {
-            let vcpu_states = self.vcpu_states.lock().unwrap();
-            vcpu_states[cpu_id].wait_until_signal_acknowledged()?;
+        // Never hold vcpu_states while waiting: a vCPU servicing ACPI hotplug
+        // MMIO may need that same lock before it can acknowledge the signal.
+        for (id, ack) in acknowledgements {
+            let deadline = time::Instant::now() + time::Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(time::Instant::now());
+                if ack.wait(true, remaining.min(time::Duration::from_millis(10))) {
+                    break;
+                }
+                if time::Instant::now() >= deadline {
+                    return Err(Error::SignalAcknowledgeTimeout);
+                }
+                self.vcpu_states.lock().unwrap()[id].signal_thread();
+            }
         }
-
+        if trace_pause {
+            crate::fork::trace_point("cpu_signal_ack");
+        }
         Ok(())
+    }
+
+    /// Called only after shutdown joined every vCPU worker. The extracted
+    /// hypervisor CPUs contain no references to the retired userspace buses.
+    pub(crate) fn park_fork_vcpus(&mut self) -> std::io::Result<()> {
+        if !self.vcpu_states.lock().unwrap().is_empty() {
+            return Err(std::io::Error::other("vCPU workers have not joined"));
+        }
+        #[cfg(target_arch = "x86_64")]
+        let topology = self.get_vcpu_topology();
+        let mut parked = Vec::new();
+        for cpu in std::mem::take(&mut self.vcpus) {
+            let cpu =
+                Arc::try_unwrap(cpu).map_err(|_| std::io::Error::other("vCPU still referenced"))?;
+            let mut cpu = cpu
+                .into_inner()
+                .map_err(|_| std::io::Error::other("vCPU lock poisoned"))?;
+            cpu.vcpu.rebind_fork_vm_ops(None)?;
+            #[cfg(target_arch = "x86_64")]
+            let id = arch::x86_64::get_x2apic_id(cpu.id, topology);
+            #[cfg(not(target_arch = "x86_64"))]
+            let id = cpu.id;
+            parked.push((id, cpu.vcpu));
+        }
+        self.vm.park_fork_vcpus(parked)
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -2791,7 +2863,7 @@ impl Pausable for CpuManager {
         // Tell the vCPUs to pause themselves next time they exit
         self.vcpus_pause_signalled.store(true, Ordering::SeqCst);
 
-        self.signal_vcpus()
+        self.signal_vcpus_with_trace(true)
             .map_err(|e| MigratableError::Pause(anyhow!("Error signalling vCPUs: {e}")))?;
 
         // Notify all guests (including Hyper-V / Windows) that the clock was
@@ -2806,17 +2878,19 @@ impl Pausable for CpuManager {
             })?;
         }
 
-        // The vCPU thread will change its paused state before parking, wait here for each
-        // activated vCPU change their state to ensure they have parked.
-        for state in self.vcpu_states.lock().unwrap().iter() {
-            if state.active() {
-                // wait for vCPU to update state
-                while !state.paused.load(Ordering::SeqCst) {
-                    // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(time::Duration::from_millis(1));
-                }
-            }
+        crate::fork::trace_point("cpu_clock_notified");
+        let acknowledgements = self
+            .vcpu_states
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|state| state.active())
+            .map(|state| Arc::clone(&state.paused))
+            .collect::<Vec<_>>();
+        for ack in acknowledgements {
+            while !ack.wait(true, time::Duration::from_secs(1)) {}
         }
+        crate::fork::trace_point("cpu_pause_ack");
 
         Ok(())
     }
@@ -2826,25 +2900,20 @@ impl Pausable for CpuManager {
         // their run vCPU loop.
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
 
-        let vcpu_states = self.vcpu_states.lock().unwrap();
+        let acknowledgements = {
+            let states = self.vcpu_states.lock().unwrap();
+            states
+                .iter()
+                .map(|state| {
+                    state.unpark_thread();
+                    Arc::clone(&state.paused)
+                })
+                .collect::<Vec<_>>()
+        };
+        for ack in acknowledgements {
+            while !ack.wait(false, time::Duration::from_secs(1)) {}
+        }
 
-        // Unpark all the vCPU threads.
-        // Step 1/2: signal each thread
-        {
-            for state in vcpu_states.iter() {
-                state.unpark_thread();
-            }
-        }
-        // Step 2/2: wait for state ACK
-        {
-            for state in vcpu_states.iter() {
-                // wait for vCPU to update state
-                while state.paused.load(Ordering::SeqCst) {
-                    // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(time::Duration::from_millis(1));
-                }
-            }
-        }
         Ok(())
     }
 }
@@ -3820,5 +3889,35 @@ mod tests {
 
         let state = vcpu.get_mp_state().unwrap();
         vcpu.set_mp_state(state).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod acknowledgement_tests {
+    use super::*;
+
+    #[test]
+    fn acknowledgement_before_wait_is_not_lost() {
+        let ack = VcpuAcknowledgement::default();
+        ack.store(true, Ordering::SeqCst);
+        assert!(ack.wait(true, time::Duration::ZERO));
+        assert!(!ack.wait(false, time::Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn pause_resume_acknowledgements_survive_repeated_handoffs() {
+        let ack = Arc::new(VcpuAcknowledgement::default());
+        let worker_ack = Arc::clone(&ack);
+        let worker = thread::spawn(move || {
+            for _ in 0..1000 {
+                assert!(worker_ack.wait(true, time::Duration::from_secs(2)));
+                worker_ack.store(false, Ordering::SeqCst);
+            }
+        });
+        for _ in 0..1000 {
+            ack.store(true, Ordering::SeqCst);
+            assert!(ack.wait(false, time::Duration::from_secs(2)));
+        }
+        worker.join().unwrap();
     }
 }

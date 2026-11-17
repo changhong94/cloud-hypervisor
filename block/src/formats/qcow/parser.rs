@@ -130,6 +130,10 @@ pub(super) type Result<T> = result::Result<T, Error>;
 
 /// Concrete backing file variants.
 pub(crate) enum BackingKind {
+    Inherited {
+        reader: std::sync::Arc<dyn metadata::BackingRead>,
+        depth: u32,
+    },
     /// Raw backing file.
     Raw(AlignedFile),
     /// QCOW2 backing parsed into metadata and raw file.
@@ -145,7 +149,15 @@ pub(crate) struct BackingFile {
 }
 
 impl BackingFile {
-    fn new(
+    pub(super) fn depth(&self) -> u32 {
+        match &self.kind {
+            BackingKind::Raw(_) => 1,
+            BackingKind::Qcow { backing, .. } => 1 + backing.as_ref().map_or(0, |b| b.depth()),
+            BackingKind::Inherited { depth, .. } => *depth,
+        }
+    }
+
+    pub(super) fn new(
         backing_file_config: Option<&BackingFileConfig>,
         direct_io: bool,
         max_nesting_depth: u32,
@@ -174,6 +186,18 @@ impl BackingFile {
                 Error::BackingFileIo(config.path.clone(), e),
             )
         })?;
+
+        if config
+            .format
+            .is_none_or(|format| format == ImageType::Qcow2)
+            && let Some((reader, virtual_size, depth)) =
+                super::prepared::take_backing(&backing_raw_file, max_nesting_depth)?
+        {
+            return Ok(Some(Self {
+                kind: BackingKind::Inherited { reader, depth },
+                virtual_size,
+            }));
+        }
 
         let mut raw_file = AlignedFile::new(backing_raw_file, direct_io);
 
@@ -239,10 +263,17 @@ impl Debug for BackingFile {
 ///
 /// Used by [`crate::formats::qcow::QcowDisk`] when opening an image.
 pub(crate) fn parse_qcow(
-    file: AlignedFile,
+    mut file: AlignedFile,
     max_nesting_depth: u32,
     sparse: bool,
 ) -> BlockResult<(metadata::QcowState, Option<BackingFile>, bool)> {
+    let prepared_metadata = if file.is_writable() {
+        super::prepared::consume_metadata(file.file())?
+    } else {
+        None
+    };
+    let prepared = prepared_metadata.is_some();
+    file.set_initial_read_cache(prepared_metadata);
     let mut header = QcowHeader::new(&file).map_err(|e| {
         let kind = match &e {
             Error::InvalidMagic
@@ -391,6 +422,7 @@ pub(crate) fn parse_qcow(
     // Image already has dirty bit set. Refcounts may be invalid.
     if IncompatFeatures::from_bits_truncate(header.incompatible_features)
         .contains(IncompatFeatures::DIRTY)
+        && !prepared
     {
         log::warn!("QCOW2 image not cleanly closed, rebuilding refcounts");
         refcount_rebuild_required = true;
@@ -485,12 +517,17 @@ pub(crate) fn parse_qcow(
         .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::GettingFileSize(e)))?
         .len();
     let mut avail_clusters = Vec::new();
-    for i in (0..file_size).step_by(cluster_size as usize) {
-        let refcount = refcounts
-            .get_cluster_refcount(&mut raw_file, i)
-            .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::GettingRefcount(e)))?;
-        if refcount == 0 {
-            avail_clusters.push(i);
+    // Read-only backing images never allocate clusters. Building their free
+    // list scans refcount blocks (and incurs direct IO) on every restore, but
+    // cannot be used by reads. Writable owners retain the full allocation scan.
+    if is_writable {
+        for i in (0..file_size).step_by(cluster_size as usize) {
+            let refcount = refcounts
+                .get_cluster_refcount(&mut raw_file, i)
+                .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::GettingRefcount(e)))?;
+            if refcount == 0 {
+                avail_clusters.push(i);
+            }
         }
     }
 
@@ -513,6 +550,9 @@ pub(crate) fn parse_qcow(
             .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
     }
 
+    // The cache contains only the initial empty leaf metadata, not guest data.
+    // Never carry it into a writable runtime or a later metadata cache miss.
+    raw_file.file_mut().set_initial_read_cache(None);
     let inner = metadata::QcowState {
         raw_file,
         header,
@@ -521,6 +561,8 @@ pub(crate) fn parse_qcow(
         l2_cache: CacheMap::new(100),
         refcounts,
         avail_clusters,
+        reserve_on_first_write: prepared,
+        initialized_clusters: Vec::new(),
         unref_clusters: Vec::new(),
     };
 
@@ -904,6 +946,26 @@ mod tests {
     use super::*;
     use crate::formats::qcow::{QcowDisk, QcowTempDisk};
     use crate::test_util::require_direct_io;
+
+    #[test]
+    fn readonly_backing_does_not_build_allocator_free_list() {
+        let file = TempFile::new().unwrap();
+        super::super::create_image(file.as_file(), 8 << 20, None).unwrap();
+        let old_len = file.as_file().metadata().unwrap().len();
+        file.as_file()
+            .set_len(old_len + (1 << DEFAULT_CLUSTER_BITS))
+            .unwrap();
+        let before = std::fs::read(file.as_path()).unwrap();
+        let readonly = File::open(file.as_path()).unwrap();
+        let (state, _, _) =
+            parse_qcow(AlignedFile::new(readonly, false), MAX_NESTING_DEPTH, true).unwrap();
+        assert!(state.avail_clusters.is_empty());
+        assert_eq!(std::fs::read(file.as_path()).unwrap(), before);
+        let writable = file.as_file().try_clone().unwrap();
+        let (state, _, _) =
+            parse_qcow(AlignedFile::new(writable, false), MAX_NESTING_DEPTH, true).unwrap();
+        assert!(state.avail_clusters.contains(&old_len));
+    }
 
     fn valid_header_v3() -> Vec<u8> {
         vec![

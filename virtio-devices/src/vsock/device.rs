@@ -22,9 +22,10 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
-use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
+use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
+use vm_virtio::checked_descriptor::DescriptorChainExt;
 use vmm_sys_util::eventfd::EventFd;
 
 /// This is the `VirtioDevice` implementation for our vsock device. It handles the virtio-level
@@ -94,6 +95,7 @@ enum Error {
 ///   - again, attempt to fetch any incoming packets queued by the backend into virtio RX buffers.
 ///
 pub(crate) struct VsockEpollHandler<B: VsockBackend> {
+    pub reset_pending: bool,
     pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
     pub queues: Vec<Queue>,
     pub queue_evts: Vec<EventFd>,
@@ -108,6 +110,39 @@ impl<B> VsockEpollHandler<B>
 where
     B: VsockBackend,
 {
+    // Virtio-vsock TRANSPORT_RESET (event id 0) makes Linux re-read the
+    // device CID and abort all connected sockets. Listening sockets survive.
+    fn process_reset(&mut self) -> result::Result<(), EpollHelperError> {
+        if !self.reset_pending {
+            return Ok(());
+        }
+        while let Some(mut chain) = self.queues[2].pop_descriptor_chain(self.mem.memory()) {
+            let head = chain.head_index();
+            let valid = chain
+                .next_checked(self.access_platform.as_deref())
+                .ok()
+                .flatten()
+                .is_some_and(|desc| {
+                    desc.is_write_only()
+                        && desc.len() >= 4
+                        && chain
+                            .memory()
+                            .write_slice(&0u32.to_le_bytes(), desc.addr())
+                            .is_ok()
+                });
+            self.queues[2]
+                .add_used(chain.memory(), head, if valid { 4 } else { 0 })
+                .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset queue: {e}")))?;
+            self.signal_used_queue(2)
+                .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset IRQ: {e}")))?;
+            if valid {
+                self.reset_pending = false;
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Signal the guest driver that we've used some virtio buffers that it had previously made
     /// available.
     ///
@@ -241,6 +276,7 @@ where
             }
         };
 
+        self.process_reset()?;
         let ev_type = event.data as u16;
         match ev_type {
             RX_QUEUE_EVENT => {
@@ -347,18 +383,21 @@ pub struct Vsock<B: VsockBackend> {
     common: VirtioCommon,
     id: String,
     cid: u64,
+    reset_pending: bool,
     backend: Arc<RwLock<B>>,
     path: PathBuf,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VsockState {
     pub avail_features: u64,
     pub acked_features: u64,
     #[serde(default)]
     pub connections: Vec<(u32, u32)>,
+    #[serde(default)]
+    pub local_port_cursor: Option<u32>,
 }
 
 impl<B> Vsock<B>
@@ -378,11 +417,16 @@ where
         exit_evt: EventFd,
         state: Option<VsockState>,
     ) -> io::Result<Vsock<B>> {
+        let reset_pending = state.is_some();
         let (avail_features, acked_features, paused) = if let Some(state) = state {
             info!("Restoring virtio-vsock {id}");
-            // Instead of letting the guest connection hang/timeout, proactively let
-            // the guest know the connection is gone.
-            backend.queue_rst_for_connections(state.connections.clone());
+            // Guest RAM still contains sockets and pending packets from the old
+            // transport. Reusing their tuples can reset an unrelated new RPC.
+            if let Some(cursor) = state.local_port_cursor {
+                backend.restore_local_port_cursor(cursor);
+            }
+            // Connections are deliberately not restored; reset the transport.
+            // A new backend owns new host sockets in each restored VM.
             (state.avail_features, state.acked_features, true)
         } else {
             let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
@@ -406,6 +450,7 @@ where
             },
             id,
             cid: cid.into(),
+            reset_pending,
             backend: Arc::new(RwLock::new(backend)),
             path,
             seccomp_action,
@@ -418,6 +463,7 @@ where
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
             connections: self.backend.read().unwrap().connections(),
+            local_port_cursor: Some(self.backend.read().unwrap().local_port_cursor()),
         }
     }
 
@@ -479,7 +525,13 @@ where
             queue_evts.push(queue_evt);
         }
 
+        if self.reset_pending {
+            queue_evts[2]
+                .write(1)
+                .map_err(crate::ActivateError::CreateEventFd)?;
+        }
         let mut handler = VsockEpollHandler {
+            reset_pending: self.reset_pending,
             mem,
             queues: virtqueues,
             queue_evts,
@@ -547,7 +599,7 @@ where
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_state(&self.state())
+        Ok(Snapshot::new_from_owned_state(self.state()))
     }
 }
 impl<B> Transportable for Vsock<B> where B: VsockBackend + Sync + 'static {}
@@ -826,6 +878,42 @@ mod tests {
                 .handle_event(&mut epoll_helper, &event)
                 .expect_err("handle_event() should have failed");
         }
+    }
+
+    #[test]
+    fn test_transport_reset_waits_for_writable_event_buffer() {
+        use vm_memory::GuestAddress;
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_epoll_handler_context();
+        ctx.handler.reset_pending = true;
+        ctx.handler.process_reset().unwrap();
+        assert!(ctx.handler.reset_pending);
+        // Reject a read-only buffer without writing guest memory.
+        ctx.guest_evvq.dtable[0].set(0x0060_0000, 4, 0, 0);
+        ctx.guest_evvq.avail.ring[0].set(0);
+        ctx.guest_evvq.avail.idx.set(1);
+        ctx.handler.process_reset().unwrap();
+        assert!(ctx.handler.reset_pending);
+        ctx.handler
+            .mem
+            .memory()
+            .write_slice(&[0xff; 4], GuestAddress(0x0060_0000))
+            .unwrap();
+        ctx.guest_evvq.dtable[1].set(0x0060_0000, 4, 2, 0);
+        ctx.guest_evvq.avail.ring[1].set(1);
+        ctx.guest_evvq.avail.idx.set(2);
+        ctx.handler.process_reset().unwrap();
+        assert!(!ctx.handler.reset_pending);
+        let mut event = [0xff; 4];
+        ctx.handler
+            .mem
+            .memory()
+            .read_slice(&mut event, GuestAddress(0x0060_0000))
+            .unwrap();
+        assert_eq!(event, [0; 4]);
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 2);
+        ctx.handler.process_reset().unwrap();
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 2);
     }
 
     #[test]

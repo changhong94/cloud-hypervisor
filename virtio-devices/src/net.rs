@@ -513,7 +513,7 @@ pub struct Net {
     announce: AnnouncementState,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NetState {
     pub avail_features: u64,
     pub acked_features: u64,
@@ -1088,7 +1088,7 @@ impl Snapshottable for Net {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_state(&self.state())
+        Ok(Snapshot::new_from_owned_state(self.state()))
     }
 }
 impl Transportable for Net {}
