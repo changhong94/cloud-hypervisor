@@ -9,6 +9,8 @@
 
 mod backing;
 mod common;
+mod compact;
+pub use compact::{MergeStats, merge_layers, merge_layers_cancellable};
 mod decoder;
 mod engine_sync;
 #[cfg(feature = "io_uring")]
@@ -16,6 +18,10 @@ mod engine_uring;
 mod header;
 mod metadata;
 mod parser;
+mod prepared;
+pub use prepared::{
+    PreparedQcowBacking, PreparedQcowOpen, PreparedQcowScope, create_prepared_image,
+};
 mod qcow_raw_file;
 mod refcount;
 mod util;
@@ -138,7 +144,7 @@ impl QcowDisk {
     }
 
     /// Synchronous read convenience for tests and benchmarks.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn read_all_at(&self, offset: u64, len: usize) -> Vec<u8> {
         let mut async_io = self.create_async_io(1).unwrap();
         let mem = Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), len)]).unwrap());
@@ -160,8 +166,7 @@ impl QcowDisk {
 }
 
 /// Writes a fresh qcow2 layout into `file`
-#[cfg(test)]
-pub(crate) fn create_image(
+pub fn create_image(
     file: &File,
     virtual_size: u64,
     backing_config: Option<&BackingFileConfig>,
@@ -175,7 +180,6 @@ pub(crate) fn create_image(
 }
 
 /// Writes a fresh qcow2 layout with an explicit cluster size into `file`
-#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn create_image_with_cluster_bits(
     file: &File,
     virtual_size: u64,
@@ -201,7 +205,9 @@ pub(crate) fn create_image_with_cluster_bits(
         .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
     let (inner, _backing, _sparse) = parse_qcow(raw, MAX_NESTING_DEPTH, true)?;
     // Flush dirty caches and clear the dirty bit
-    QcowMetadata::new(inner).shutdown();
+    QcowMetadata::new(inner)
+        .finish()
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
     Ok(())
 }
 
@@ -320,7 +326,24 @@ impl disk_file::Resizable for QcowDisk {
     }
 }
 
+struct QcowForkRetirement(Arc<QcowMetadata>);
+impl disk_file::ForkRetirement for QcowForkRetirement {
+    fn finish(&self) -> BlockResult<()> {
+        self.0
+            .finish()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::SyncMetadata(e)))
+    }
+}
+
 impl disk_file::MetadataSync for QcowDisk {
+    fn prepare_fork_backing(&self) -> BlockResult<Option<PreparedQcowBacking>> {
+        prepared::prepare_backing(self).map(Some)
+    }
+    fn defer_fork_shutdown(&self) -> Option<Box<dyn disk_file::ForkRetirement>> {
+        self.metadata
+            .retain_fork_close()
+            .map(|owner| Box::new(QcowForkRetirement(owner)) as Box<dyn disk_file::ForkRetirement>)
+    }
     fn sync_metadata(&self) -> BlockResult<()> {
         self.metadata
             .flush()
@@ -381,6 +404,158 @@ mod tests {
     use crate::async_io::AsyncIo;
     use crate::disk_file::{AsyncDiskFile, DiskSize, PhysicalSize};
 
+    #[test]
+    fn final_checkpoint_includes_writes_after_preflush() {
+        use crate::disk_file::MetadataSync;
+        let file = make_qcow_file();
+        let inspect = file.try_clone().unwrap();
+        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        disk.write_all_at(8192, &vec![0x11; 32768]);
+        disk.sync_metadata().unwrap();
+        // Both overwrite an existing cluster and allocate a new mapping after
+        // the speculative flush. Only the final checkpoint may seal the disk.
+        disk.write_all_at(8192, &vec![0x22; 32768]);
+        disk.write_all_at(196608, &vec![0x33; 32768]);
+        disk.sync_metadata().unwrap();
+        let close = disk.defer_fork_shutdown().unwrap();
+        drop(disk);
+        let reader = QcowDisk::new(
+            File::open(format!("/proc/self/fd/{}", inspect.as_raw_fd())).unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reader.read_all_at(8192, 32768), vec![0x22; 32768]);
+        assert_eq!(reader.read_all_at(196608, 32768), vec![0x33; 32768]);
+        close.finish().unwrap();
+    }
+
+    #[test]
+    fn deferred_close_keeps_checkpoint_readable_until_clean_marker_is_durable() {
+        use crate::disk_file::MetadataSync;
+        let file = make_qcow_file();
+        let inspect = file.try_clone().unwrap();
+        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let bytes = vec![0x6a; 131072];
+        disk.write_all_at(8192, &bytes);
+        disk.sync_metadata().unwrap();
+        let close = disk.defer_fork_shutdown().unwrap();
+        drop(disk);
+        assert!(dirty_bit_is_set(&inspect));
+        let reader = QcowDisk::new(
+            File::open(format!("/proc/self/fd/{}", inspect.as_raw_fd())).unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reader.read_all_at(8192, bytes.len()), bytes);
+        close.finish().unwrap();
+        assert!(!dirty_bit_is_set(&inspect));
+        close.finish().unwrap();
+        drop(close);
+        assert_eq!(reader.read_all_at(8192, bytes.len()), bytes);
+    }
+
+    #[test]
+    fn fork_retirement_crash_helper() {
+        use crate::disk_file::MetadataSync;
+        let Some(path) = std::env::var_os("QCOW_RETIRE_CRASH_IMAGE") else {
+            return;
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        disk.write_all_at(65536, &vec![0x11; 131072]);
+        disk.sync_metadata().unwrap();
+        disk.write_all_at(65536, &vec![0x9b; 131072]);
+        disk.sync_metadata().unwrap();
+        let _close = disk.defer_fork_shutdown().unwrap();
+        drop(disk);
+        // Deliberately skip Drop, as for a writer dying before deferred close.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn interrupted_close_recovers_durable_checkpoint_with_dirty_marker() {
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        create_image(file.as_file(), 8 << 20, None).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "formats::qcow::tests::fork_retirement_crash_helper",
+            ])
+            .env("QCOW_RETIRE_CRASH_IMAGE", file.as_path())
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert!(dirty_bit_is_set(file.as_file()));
+        // Recovery must rebuild refcounts from the durable image, without a
+        // graceful writer shutdown or access to its in-memory metadata.
+        let disk = QcowDisk::new(
+            file.as_file().try_clone().unwrap(),
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(disk.read_all_at(65536, 131072), vec![0x9b; 131072]);
+        drop(disk);
+        assert!(!dirty_bit_is_set(file.as_file()));
+    }
+
+    #[test]
+    fn new_leaves_copy_on_write_and_reopen_independently() {
+        let base = TempFile::new().unwrap();
+        base.as_file().set_len(1024 * 1024).unwrap();
+        base.as_file().write_all_at(&vec![10; 131072], 0).unwrap();
+        let backing = BackingFileConfig {
+            path: base.as_path().to_str().unwrap().into(),
+            format: Some(ImageType::Raw),
+        };
+        let parent = TempFile::new().unwrap();
+        let child = TempFile::new().unwrap();
+        for leaf in [&parent, &child] {
+            create_image(leaf.as_file(), 1024 * 1024, Some(&backing)).unwrap();
+        }
+        for (leaf, value) in [(&parent, 20), (&child, 30)] {
+            let disk = QcowDisk::new(
+                leaf.as_file().try_clone().unwrap(),
+                false,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(disk.read_all_at(0, 131072), vec![10; 131072]);
+            // Partial-cluster overwrite must retain the surrounding backing bytes.
+            disk.write_all_at(512, &vec![value; 512]);
+        }
+        for (leaf, value) in [(&parent, 20), (&child, 30)] {
+            let disk = QcowDisk::new(
+                leaf.as_file().try_clone().unwrap(),
+                false,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+            let mut expected = vec![10; 131072];
+            expected[512..1024].fill(value);
+            assert_eq!(disk.read_all_at(0, 131072), expected);
+        }
+        let mut original = vec![0; 131072];
+        base.as_file().read_exact_at(&mut original, 0).unwrap();
+        assert_eq!(original, vec![10; 131072]);
+    }
+
     const TEST_SIZE: u64 = 0x5566_7788;
 
     fn make_qcow_file() -> File {
@@ -434,6 +609,23 @@ mod tests {
         let disk = QcowDisk::new(file, false, false, true, false).unwrap();
         let cloned = disk.try_clone().unwrap();
         assert_async_io_from_dyn(cloned.as_ref(), false);
+    }
+
+    #[test]
+    fn read_only_finish_preserves_live_writer_dirty_state() {
+        use std::os::fd::AsRawFd;
+        let file = make_qcow_file();
+        let inspect = file.try_clone().unwrap();
+        let writer = QcowDisk::new(file, false, false, true, false).unwrap();
+        let read_only = File::open(format!("/proc/self/fd/{}", inspect.as_raw_fd())).unwrap();
+        let reader = QcowDisk::new(read_only, false, false, true, false).unwrap();
+        reader.read_all_at(0, 512);
+        reader.metadata().finish().unwrap();
+        assert!(dirty_bit_is_set(&inspect));
+        drop(reader);
+        assert!(dirty_bit_is_set(&inspect));
+        drop(writer);
+        assert!(!dirty_bit_is_set(&inspect));
     }
 
     #[test]

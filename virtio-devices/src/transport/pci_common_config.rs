@@ -437,7 +437,7 @@ impl Snapshottable for VirtioPciCommonConfig {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_state(&self.state())
+        Ok(Snapshot::new_from_owned_state(self.state()))
     }
 }
 

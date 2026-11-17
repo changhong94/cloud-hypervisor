@@ -188,6 +188,11 @@ impl BusDevice for Ioapic {
 }
 
 impl Ioapic {
+    /// Detach old host eventfds without modifying the captured IOAPIC state.
+    pub fn detach_fork_irqfds(&self) -> std::io::Result<()> {
+        self.interrupt_source_group.disable()
+    }
+
     pub fn new(
         id: String,
         apic_address: GuestAddress,

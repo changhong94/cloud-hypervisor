@@ -508,6 +508,63 @@ paths:
           description: The new device could not be added to the VM instance.
       summary: Add a new userspace device to the VM
 
+  /vm.fork:
+    put:
+      summary: Accept an experimental same-host VM fork.
+      description: >-
+        Requires x86_64 KVM, --enable-fork, a path API socket, private
+        anonymous RAM, socket serial, console off and local read-only disks.
+        External devices, event monitor, D-Bus, debugger and landlock are not
+        supported. The source may be Running or Paused. The source runtime and
+        HTTP service are stopped and rebuilt; the child gets a separate process
+        and API socket. RAM stays in memory and is shared through host CoW.
+        This acknowledgement precedes host fork and restoration. Reconnect and
+        poll vm.fork-status on the parent using the returned operation_id until
+        Ready, attach both serial sockets, then explicitly resume each VM.
+        Failures report Failed with an error and restore the parent's prior
+        Running/Paused state. The default seccomp policy is supported using
+        an opt-in supervisor policy; worker filters remain enabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmForkConfig"
+      responses:
+        200:
+          description: Fork accepted; connections will close during restart. This is not readiness.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmForkOperation"
+        400:
+          description: Unsupported configuration or invalid child socket paths.
+        409:
+          description: VM is migrating, restoring, or another fork is pending.
+        500:
+          description: VM is unavailable or state capture failed.
+        503:
+          description: Old runtime stopped; reconnect and query operation status before retrying.
+
+  /vm.fork-status:
+    get:
+      summary: List the most recent 64 in-memory fork operations.
+      description: >-
+        Query the source process. Accepted and Restoring are pending. Ready
+        requires both runtime and HTTP startup acknowledgements. Failed includes
+        child startup, early exit or timeout errors. ChildExited is refreshed on
+        query using PID and process start time. History does not survive process
+        restart. Timings exclude the caller-controlled wait before vm.resume.
+      responses:
+        200:
+          description: Fork operation records, oldest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VmForkOperation"
+
   /vm.snapshot:
     put:
       summary: Returns a VM snapshot.
@@ -1681,6 +1738,67 @@ components:
       properties:
         id:
           type: string
+
+    VmForkOperation:
+      type: object
+      required: [operation_id, state, parent_pid, child_pid, child_api_socket, error, capture_ms, parent_ready_ms, ready_ms]
+      properties:
+        operation_id:
+          type: string
+        state:
+          type: string
+          enum: [Accepted, Restoring, Ready, Failed, ChildExited]
+        parent_pid:
+          type: integer
+        child_pid:
+          type: integer
+          nullable: true
+        child_api_socket:
+          type: string
+        error:
+          type: string
+          nullable: true
+        capture_ms:
+          type: number
+          description: Elapsed pause, capture and VM teardown time in milliseconds.
+        parent_ready_ms:
+          type: number
+          nullable: true
+          description: Elapsed time until parent runtime and API startup, from before pause.
+        ready_ms:
+          type: number
+          nullable: true
+          description: Elapsed time until operation completion or failure recovery, from before pause.
+
+    VmForkConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - child_api_socket
+        - child_serial_socket
+      properties:
+        child_api_socket:
+          type: string
+          description: Absolute unused path for the child's HTTP API socket.
+        child_serial_socket:
+          type: string
+          description: Absolute unused path for the child's serial socket, different from its API socket.
+
+        parent_disk_dir:
+          type: string
+          description: Required with one writable buffered disk. Absolute managed directory on the same filesystem as the source; created on first fork.
+        child_disk_dir:
+          type: string
+          description: Required with parent_disk_dir. New separate directory on the same filesystem. Owns hard links to sealed history and a private qcow2 leaf; caller owns cleanup after child exit.
+        child_net:
+          $ref: "#/components/schemas/NetConfig"
+          description: Independent named TAP and MAC; one NIC with unchanged topology.
+        child_netns:
+          type: string
+          description: Absolute path to a distinct child network namespace; required with child_net.
+        child_vsock:
+          $ref: '#/components/schemas/VsockConfig'
+          description: Required for a vsock source. CID must differ from parent; socket must be an unused absolute path. Existing connections are reset in both branches.
 
     VmSnapshotConfig:
       type: object

@@ -524,7 +524,7 @@ impl From<PciConfigurationRegisterState> for Vec<u32> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PciConfigurationState {
     registers: PciConfigurationRegisterState,
     writable_bits: PciConfigurationRegisterState,
@@ -1329,7 +1329,7 @@ impl Snapshottable for PciConfiguration {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_state(&self.state())
+        Ok(Snapshot::new_from_owned_state(self.state()))
     }
 }
 
@@ -1647,6 +1647,28 @@ mod tests {
         let actual_vec: Vec<u32> = state.writable_bits.into();
         let expected: &[u32] = &[1, 0, 0, 0, 0, 7, 0, 9];
         assert_eq!(&actual_vec[..8], expected);
+    }
+
+    #[test]
+    fn native_pci_snapshot_preserves_wire_and_independent_restores() {
+        let mut original = reloc_config(None);
+        add_reloc_bar(&mut original, 0, 0x1000_0000);
+        let native = original.snapshot().unwrap();
+        let legacy = Snapshot::new_from_state(&original.state()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&native).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
+        let persisted: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&native).unwrap()).unwrap();
+        let mut parent = reloc_config(Some(native.to_owned_state().unwrap()));
+        let child = reloc_config(Some(persisted.to_owned_state().unwrap()));
+        assert_eq!(parent.registers, child.registers);
+        assert_eq!(parent.writable_bits, child.writable_bits);
+        parent.registers[0] ^= 0xffff;
+        assert_eq!(child.registers[0], original.registers[0]);
+        let another = reloc_config(Some(native.to_owned_state().unwrap()));
+        assert_eq!(another.registers, child.registers);
     }
 
     const RELOC_BAR_SIZE: u64 = 0x8_0000;

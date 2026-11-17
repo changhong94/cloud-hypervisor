@@ -110,7 +110,12 @@ zbus = { version = "5.15.0", optional = true }
 zerocopy = { workspace = true, features = ["alloc", "derive"] }
 
 [dev-dependencies]
+block = { path = "../block", features = ["test-utils"] }
 tempfile = "3"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "linux_fork"
+required-features = ["kvm"]

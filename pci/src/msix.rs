@@ -65,7 +65,7 @@ impl Default for MsixTableEntry {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MsixConfigState {
     table_entries: Vec<MsixTableEntry>,
     pba_entries: Vec<u64>,
@@ -138,6 +138,11 @@ pub struct MsixConfig {
 }
 
 impl MsixConfig {
+    /// Disable only the host registrations after the device state is captured.
+    pub fn detach_fork_irqfds(&self) -> io::Result<()> {
+        self.interrupt_source_group.disable()
+    }
+
     pub fn new(
         msix_vectors: u16,
         interrupt_source_group: MaybeMutInterruptSourceGroup,
@@ -531,7 +536,7 @@ impl Snapshottable for MsixConfig {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_state(&self.state())
+        Ok(Snapshot::new_from_owned_state(self.state()))
     }
 }
 

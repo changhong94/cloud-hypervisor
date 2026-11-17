@@ -17,9 +17,9 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use std::{io, mem, result, thread};
+use std::{io, mem, result};
 
 use anyhow::anyhow;
 use block::async_io::{AsyncIo, AsyncIoError};
@@ -145,13 +145,45 @@ impl Default for BlockCounters {
     }
 }
 
+#[derive(Default)]
+struct ActiveRequests {
+    count: AtomicUsize,
+    waiting: AtomicBool,
+    lock: Mutex<()>,
+    changed: Condvar,
+}
+
+impl ActiveRequests {
+    fn wait_empty(&self, timeout: Duration) -> bool {
+        let guard = self.lock.lock().unwrap();
+        self.waiting.store(true, Ordering::SeqCst);
+        let _guard = self
+            .changed
+            .wait_timeout_while(guard, timeout, |_| self.count.load(Ordering::SeqCst) != 0)
+            .unwrap();
+        self.waiting.store(false, Ordering::SeqCst);
+        self.count.load(Ordering::SeqCst) == 0
+    }
+
+    fn complete(&self) {
+        let previous = self.count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0);
+        if previous == 1 && self.waiting.load(Ordering::SeqCst) {
+            // Pair the zero transition with the waiter's predicate/park lock.
+            // No worker or completion thread can be left sleeping through it.
+            let _guard = self.lock.lock().unwrap();
+            self.changed.notify_all();
+        }
+    }
+}
+
 /// Releases one active request count when dropped.
 struct ActiveRequestGuard {
-    counter: Arc<AtomicUsize>,
+    counter: Arc<ActiveRequests>,
 }
 
 impl ActiveRequestGuard {
-    fn new(counter: &Arc<AtomicUsize>) -> Self {
+    fn new(counter: &Arc<ActiveRequests>) -> Self {
         Self {
             counter: Arc::clone(counter),
         }
@@ -160,8 +192,7 @@ impl ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        let previous = self.counter.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(previous > 0);
+        self.counter.complete();
     }
 }
 
@@ -181,7 +212,7 @@ struct BlockEpollHandler {
     inflight_requests: VecDeque<(u16, Request)>,
     // The active count includes `inflight_requests` plus requests in transition
     // from the queue to inflight or inflight to completion.
-    active_request_count: Arc<AtomicUsize>,
+    active_request_count: Arc<ActiveRequests>,
     // True when draining before pause.
     draining_active_requests: Arc<AtomicBool>,
     rate_limiter: Option<RateLimiterGroupHandle>,
@@ -228,7 +259,9 @@ impl BlockEpollHandler {
     fn process_queue_submit(&mut self) -> Result<()> {
         // Artificially bump the active counter while submitting so pause doesn't
         // race and read a zero.
-        self.active_request_count.fetch_add(1, Ordering::SeqCst);
+        self.active_request_count
+            .count
+            .fetch_add(1, Ordering::SeqCst);
         let _active_request = ActiveRequestGuard::new(&self.active_request_count);
         // Clone the Arc so the `self.queue` mutable borrow is allowed.
         let draining_active_requests = Arc::clone(&self.draining_active_requests);
@@ -355,7 +388,9 @@ impl BlockEpollHandler {
                 } else {
                     self.inflight_requests
                         .push_back((desc_chain.head_index(), request));
-                    self.active_request_count.fetch_add(1, Ordering::SeqCst);
+                    self.active_request_count
+                        .count
+                        .fetch_add(1, Ordering::SeqCst);
                 }
             } else {
                 let status = match result {
@@ -395,6 +430,7 @@ impl BlockEpollHandler {
                     let batch_len = batch_inflight_requests.len();
                     self.inflight_requests.extend(batch_inflight_requests);
                     self.active_request_count
+                        .count
                         .fetch_add(batch_len, Ordering::SeqCst);
                 }
                 Err(e) => {
@@ -758,11 +794,11 @@ pub struct Block {
     queue_affinity: BTreeMap<u16, Box<[usize]>>,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
-    active_request_count: Arc<AtomicUsize>,
+    active_request_count: Arc<ActiveRequests>,
     draining_active_requests: Arc<AtomicBool>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BlockState {
     pub disk_path: String,
     pub disk_nsectors: u64,
@@ -926,7 +962,7 @@ impl Block {
             queue_affinity,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
-            active_request_count: Arc::new(AtomicUsize::new(0)),
+            active_request_count: Arc::new(ActiveRequests::default()),
             draining_active_requests: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -940,7 +976,7 @@ impl Block {
         let mut next_warning = BLOCK_PAUSE_FIRST_DRAIN_WARNING;
 
         loop {
-            let active = self.active_request_count.load(Ordering::SeqCst);
+            let active = self.active_request_count.count.load(Ordering::SeqCst);
             if active == 0 {
                 return Ok(());
             }
@@ -955,7 +991,13 @@ impl Block {
                 next_warning += BLOCK_PAUSE_DRAIN_WARNING_INTERVAL;
             }
 
-            thread::yield_now();
+            if self.active_request_count.wait_empty(
+                next_warning
+                    .min(BLOCK_PAUSE_DRAIN_TIMEOUT)
+                    .saturating_sub(elapsed),
+            ) {
+                return Ok(());
+            }
         }
     }
 
@@ -990,6 +1032,30 @@ impl Block {
                 }
             }
         }
+    }
+
+    /// The fork caller has drained/paused this device and will destroy it.
+    /// Latency preparation, using the ordinary guest-flush backend
+    /// while vCPUs and queue workers still run. This is NOT the checkpoint:
+    /// pause must still drain in-flight writes and sync_metadata again.
+    pub fn preflush_fork(&self) -> block::error::BlockResult<()> {
+        if !self.read_only() {
+            self.disk_image.sync_metadata()?;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_fork_backing(
+        &self,
+    ) -> block::error::BlockResult<Option<block::formats::qcow::PreparedQcowBacking>> {
+        if self.read_only() {
+            return Ok(None);
+        }
+        self.disk_image.prepare_fork_backing()
+    }
+
+    pub fn retain_fork_close(&self) -> Option<Box<dyn block::disk_file::ForkRetirement>> {
+        self.disk_image.defer_fork_shutdown()
     }
 
     /// Tries to set an advisory lock for the corresponding disk image.
@@ -1235,7 +1301,7 @@ impl VirtioDevice for Block {
     fn reset(&mut self) {
         self.common.reset();
         self.draining_active_requests.store(false, Ordering::SeqCst);
-        self.active_request_count.store(0, Ordering::SeqCst);
+        self.active_request_count.count.store(0, Ordering::SeqCst);
         self.set_writeback_mode(true);
         event!("virtio-device", "reset", "id", &self.id);
     }
@@ -1305,6 +1371,23 @@ impl VirtioDevice for Block {
 
 impl Pausable for Block {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
+        let trace_id = std::env::var_os("CH_FORK_TIMING").map(|_| self.id.clone());
+        let started = Instant::now();
+        let trace = |phase: &str| {
+            if let Some(id) = &trace_id {
+                let sched =
+                    std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+                let mut fields = sched.split_whitespace();
+                let run = fields.next().unwrap_or("0");
+                let wait = fields.next().unwrap_or("0");
+                eprintln!(
+                    "VM_FORK block_pause pid={} id={id} phase={phase} elapsed_ms={:.3} run_ns={run} wait_ns={wait}",
+                    std::process::id(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
+        trace("begin");
         self.draining_active_requests.store(true, Ordering::SeqCst);
 
         // Drain before parking the worker threads: the workers are what
@@ -1314,6 +1397,7 @@ impl Pausable for Block {
             .wait_for_active_requests()
             .map_err(MigratableError::Pause)
             .and_then(|()| {
+                trace("drained");
                 // Flush cached format metadata (e.g. qcow2 L2/refcount tables) so
                 // the on-disk image is self-consistent while paused: snapshot
                 // copies and migration disk-lock handoff read the file directly.
@@ -1321,7 +1405,12 @@ impl Pausable for Block {
                     MigratableError::Pause(anyhow::Error::new(e).context("sync disk metadata"))
                 })
             })
-            .and_then(|()| self.common.pause());
+            .and_then(|()| {
+                trace("metadata_synced");
+                let result = self.common.pause();
+                trace("workers_parked");
+                result
+            });
 
         self.draining_active_requests.store(false, Ordering::SeqCst);
         result
@@ -1339,7 +1428,7 @@ impl Snapshottable for Block {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_state(&self.state())
+        Ok(Snapshot::new_from_owned_state(self.state()))
     }
 }
 impl Transportable for Block {}
@@ -1417,7 +1506,7 @@ mod tests {
             counters: BlockCounters::default(),
             queue_evt: evt(),
             inflight_requests: VecDeque::new(),
-            active_request_count: Arc::new(AtomicUsize::new(0)),
+            active_request_count: Arc::new(ActiveRequests::default()),
             draining_active_requests: Arc::new(AtomicBool::new(false)),
             rate_limiter: None,
             access_platform: None,
@@ -1428,5 +1517,23 @@ mod tests {
         handler.process_queue_submit().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod active_requests_tests {
+    use super::*;
+    #[test]
+    fn completion_before_or_during_drain_is_not_lost() {
+        let requests = Arc::new(ActiveRequests::default());
+        assert!(requests.wait_empty(Duration::ZERO));
+        for _ in 0..100 {
+            requests.count.store(1, Ordering::SeqCst);
+            assert!(!requests.wait_empty(Duration::ZERO));
+            let worker = Arc::clone(&requests);
+            let thread = std::thread::spawn(move || worker.complete());
+            assert!(requests.wait_empty(Duration::from_secs(1)));
+            thread.join().unwrap();
+        }
     }
 }

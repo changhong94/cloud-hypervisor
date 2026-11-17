@@ -367,6 +367,18 @@ pub(crate) type Result<T> = anyhow::Result<T, HypervisorCpuError>;
 /// Trait to represent a generic Vcpu
 ///
 pub trait Vcpu: Send + Sync {
+    /// Rebind only after KVM_RUN workers have joined. Detaching old buses is
+    /// necessary before retaining a vCPU across host-runtime reconstruction.
+    fn rebind_fork_vm_ops(
+        &mut self,
+        _ops: Option<std::sync::Arc<dyn crate::VmOps>>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other("vCPU reuse is unsupported"))
+    }
+    fn fork_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
     ///
     /// Returns StandardRegisters with default value set
     ///
