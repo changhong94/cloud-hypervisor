@@ -671,7 +671,9 @@ impl QcowHeader {
                 self.incompatible_features &= !IncompatFeatures::DIRTY.bits();
             }
             self.write_incompatible_features(file)?;
-            file.fsync()
+            // These feature flags are image data, not host inode metadata. Keep the
+            // durability barrier, but avoid syncing host access/modify times.
+            file.sync_data()
                 .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::SyncingHeader(e)))?;
         }
         Ok(())
@@ -685,7 +687,9 @@ impl QcowHeader {
         if self.version == 3 {
             self.incompatible_features |= IncompatFeatures::CORRUPT.bits();
             self.write_incompatible_features(file)?;
-            file.fsync()
+            // These feature flags are image data, not host inode metadata. Keep the
+            // durability barrier, but avoid syncing host access/modify times.
+            file.sync_data()
                 .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::SyncingHeader(e)))?;
         }
         Ok(())

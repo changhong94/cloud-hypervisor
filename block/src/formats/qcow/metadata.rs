@@ -118,6 +118,8 @@ pub(super) enum DeallocAction {
 pub(super) struct QcowMetadata {
     inner: RwLock<QcowState>,
     decoder: Arc<dyn Decoder>,
+    retirement_owner: std::sync::atomic::AtomicU32,
+    finished: std::sync::atomic::AtomicBool,
 }
 
 /// The actual metadata state, accessible only through the RwLock.
@@ -128,6 +130,9 @@ pub(crate) struct QcowState {
     pub(crate) l2_cache: CacheMap<VecCache<u64>>,
     pub(crate) refcounts: RefCount,
     pub(crate) avail_clusters: Vec<u64>,
+    /// One bounded allocation batch on first use of a fresh prepared fork leaf.
+    pub(crate) reserve_on_first_write: bool,
+    pub(crate) initialized_clusters: Vec<u64>,
     pub(crate) unref_clusters: Vec<u64>,
     /// Dedicated file descriptor for metadata I/O covering L2 table reads,
     /// refcount block reads and dirty eviction writes. This is a dup clone
@@ -140,6 +145,8 @@ impl QcowMetadata {
         QcowMetadata {
             decoder: Arc::from(inner.header.get_decoder()),
             inner: RwLock::new(inner),
+            retirement_owner: std::sync::atomic::AtomicU32::new(0),
+            finished: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -219,6 +226,31 @@ impl QcowMetadata {
         Ok(mappings)
     }
 
+    /// Enumerate one L2 table at a time for offline compaction. Explicit zero
+    /// entries are data overrides too: skipping them would resurrect backing data.
+    pub(super) fn allocated_clusters(&self, l1_index: usize) -> io::Result<Vec<u64>> {
+        let mut inner = self.inner.write().unwrap();
+        let Some(&table) = inner.l1_table.get(l1_index) else {
+            return Ok(Vec::new());
+        };
+        if table == 0 {
+            return Ok(Vec::new());
+        }
+        inner.cache_l2_cluster(l1_index, table)?;
+        let cluster_size = inner.raw_file.cluster_size();
+        Ok(inner
+            .l2_cache
+            .get(l1_index)
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &entry)| {
+                let offset = (l1_index as u64 * inner.l2_entries + index as u64) * cluster_size;
+                (!l2_entry_is_empty(entry) && offset < inner.header.size).then_some(offset)
+            })
+            .collect())
+    }
+
     /// Maps a guest write address to a write mapping.
     ///
     /// Always takes a write lock since writes may need to allocate clusters,
@@ -248,16 +280,77 @@ impl QcowMetadata {
     /// Flushes dirty metadata caches and clears the dirty bit for
     /// clean shutdown.
     pub(super) fn shutdown(&self) {
+        let _ = self.finish();
+    }
+
+    pub(super) fn fork_backing_config(
+        &self,
+    ) -> io::Result<Option<super::header::BackingFileConfig>> {
+        use std::os::fd::AsRawFd;
+        let inner = self.inner.read().unwrap();
+        let mut config = inner.header.backing_file.clone();
+        if let Some(config) = &mut config
+            && !std::path::Path::new(&config.path).is_absolute()
+        {
+            let path = std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                inner.raw_file.file().as_raw_fd()
+            ))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("Missing backing directory"))?;
+            config.path = parent.join(&config.path).to_string_lossy().into_owned();
+        }
+        Ok(config)
+    }
+
+    pub(super) fn fork_close_retained(&self) -> bool {
+        self.retirement_owner
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
+    pub(super) fn retain_fork_close(self: &Arc<Self>) -> Option<Arc<Self>> {
+        if !self.inner.read().unwrap().raw_file.file().is_writable() {
+            return None;
+        }
+        let retained = Arc::clone(self);
+        self.retirement_owner
+            .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        Some(retained)
+    }
+
+    pub(super) fn finish(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let owner = self.retirement_owner.load(Ordering::Acquire);
+        if owner != 0 && owner != std::process::id() {
+            return Ok(());
+        }
         let mut inner = self.inner.write().unwrap();
-        let _ = inner.sync_caches();
+        if self.finished.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Read-only backing owners cannot have made persistent changes. Their
+        // destruction must not wait for unrelated filesystem journal commits.
+        // Writable owners still flush all caches/data and clear the dirty bit.
+        if !inner.raw_file.file().is_writable() {
+            return Ok(());
+        }
+        inner.sync_caches()?;
         let QcowState {
             ref mut header,
             ref mut raw_file,
             ..
         } = *inner;
         if raw_file.file().is_writable() {
-            let _ = header.set_dirty_bit(raw_file.file_mut(), false);
+            header
+                .set_dirty_bit(raw_file.file_mut(), false)
+                .map_err(io::Error::other)?;
         }
+        // Set only after all data/metadata and the clean header are durable.
+        // Drop must not issue the same terminal writes a second time.
+        self.finished.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Resizes the QCOW2 image to the given new size. Only grow is
@@ -671,6 +764,37 @@ impl QcowState {
 
     /// Allocates a new cluster from the free list or by extending the file.
     fn get_new_cluster(&mut self, initial_data: Option<Vec<u8>>) -> io::Result<u64> {
+        if self.reserve_on_first_write && self.avail_clusters.is_empty() {
+            self.reserve_on_first_write = false;
+            let cluster_size = self.raw_file.cluster_size();
+            let count = self.header.size.min(16 * 1024 * 1024) / cluster_size;
+            let max_valid = self.refcounts.max_valid_cluster_offset();
+            let zeros = vec![0u8; cluster_size as usize];
+            // Populate only unreferenced clusters, under the metadata writer
+            // lock, when the guest first needs storage. Initial fork leaves
+            // remain small. Initialized extents avoid repeated host allocation
+            // commits during later checkpoints; all flush ordering is unchanged.
+            for _ in 0..count {
+                let Some(address) = self.raw_file.add_cluster_end(max_valid)? else {
+                    break;
+                };
+                if address == 0 {
+                    return Err(io::Error::from_raw_os_error(EIO));
+                }
+                // Write actual zeros: ZERO_RANGE may create unwritten extents
+                // which would need another metadata conversion on first use.
+                self.raw_file.write_cluster(address, &zeros)?;
+                self.initialized_clusters.push(address);
+            }
+        }
+        if let Some(address) = self.initialized_clusters.pop() {
+            // Only never-used, initialized zero clusters enter this list. Do
+            // not ZERO_RANGE them again and turn them into unwritten extents.
+            if let Some(initial_data) = initial_data {
+                self.raw_file.write_cluster(address, &initial_data)?;
+            }
+            return Ok(address);
+        }
         if let Some(free_cluster) = self.avail_clusters.pop() {
             if free_cluster == 0 {
                 self.set_corrupt_bit_best_effort();
@@ -816,7 +940,7 @@ impl QcowState {
             .write_to(self.raw_file.file_mut())
             .map_err(|e| io::Error::other(format!("failed to write header during resize: {e}")))?;
 
-        self.raw_file.file_mut().sync_all()?;
+        self.raw_file.file_mut().sync_data()?;
 
         Ok(())
     }
@@ -862,7 +986,7 @@ impl QcowState {
         self.raw_file
             .write_pointer_table_direct(new_l1_offset, new_l1_data.iter())?;
 
-        self.raw_file.file_mut().sync_all()?;
+        self.raw_file.file_mut().sync_data()?;
 
         self.header.l1_size = new_l1_size;
         self.header.l1_table_offset = new_l1_offset;
@@ -871,7 +995,7 @@ impl QcowState {
             .write_to(self.raw_file.file_mut())
             .map_err(|e| io::Error::other(format!("failed to write header during resize: {e}")))?;
 
-        self.raw_file.file_mut().sync_all()?;
+        self.raw_file.file_mut().sync_data()?;
 
         // Free old L1 table clusters
         let old_l1_bytes = old_l1_size as u64 * size_of::<u64>() as u64;
@@ -1073,8 +1197,9 @@ impl QcowState {
         }
         // Write the modified refcount blocks.
         self.refcounts.flush_blocks(&mut self.raw_file)?;
-        // Sync metadata and data clusters.
-        self.raw_file.file_mut().sync_all()?;
+        // QCOW metadata is file content. Persist it and any required size/extent
+        // updates, without forcing unrelated host timestamp journal commits.
+        self.raw_file.file_mut().sync_data()?;
 
         // Push L1 table and refcount table last.
         let mut sync_required = if self.l1_table.dirty() {

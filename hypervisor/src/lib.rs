@@ -271,6 +271,8 @@ pub struct HypervisorVmConfig {
     pub vmsa_features: u64,
     pub nested: bool,
     pub smt_enabled: bool,
+    /// Optional per-VM KVM halt polling ceiling. None preserves the host default.
+    pub halt_poll_ns: Option<u64>,
 }
 
 #[derive(Copy, Clone)]
