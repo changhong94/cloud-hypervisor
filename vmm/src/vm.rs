@@ -1531,17 +1531,11 @@ impl Vm {
             if let Some(ref igvm) = igvm_file {
                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
             }
-            // Live fork families may oversubscribe the host, so keep their
-            // immediate-yield policy. Snapshot pool slots are stopped until
-            // claimed: allow a bounded polling budget for their short I/O
-            // exchanges instead of forcing a scheduler handoff on every halt.
-            // Both policies are per VM; normal boots and host defaults remain.
+            // Live fork families may oversubscribe the host. Snapshot restores
+            // retain the host's normal polling policy rather than a benchmark-
+            // selected busy-wait budget.
             if inherited_memory.is_some() {
                 hv_config.halt_poll_ns = Some(0);
-            } else if snapshot.is_some()
-                && memory_restore_mode == Some(MemoryRestoreMode::CopyOnWrite)
-            {
-                hv_config.halt_poll_ns = Some(200_000);
             }
             Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
         };
