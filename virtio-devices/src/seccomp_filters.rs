@@ -327,7 +327,8 @@ fn virtio_watchdog_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     ]
 }
 
-fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
+/// Rules used by a worker and by the parent supervisor before spawning it.
+pub fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
     let mut rules = match thread_type {
         Thread::VirtioBalloon => virtio_balloon_thread_rules(),
         Thread::VirtioBlock => virtio_block_thread_rules(),

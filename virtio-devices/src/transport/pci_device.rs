@@ -299,7 +299,7 @@ const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get device ID.
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct QueueState {
     max_size: u16,
     size: u16,
@@ -309,7 +309,7 @@ struct QueueState {
     used_ring: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct VirtioPciDeviceState {
     device_activated: bool,
     queues: Vec<QueueState>,
@@ -424,6 +424,11 @@ pub struct VirtioPciDevice {
 }
 
 impl VirtioPciDevice {
+    /// Snapshot is already captured and all device workers are paused.
+    pub fn detach_fork_irqfds(&self) -> io::Result<()> {
+        self.msix_config.lock().unwrap().detach_fork_irqfds()
+    }
+
     /// Constructs a new PCI transport for the given virtio device.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -486,7 +491,7 @@ impl VirtioPciDevice {
             })?
         };
         let msix_state =
-            vm_migration::state_from_id(snapshot, pci::MSIX_CONFIG_ID).map_err(|e| {
+            vm_migration::owned_state_from_id(snapshot, pci::MSIX_CONFIG_ID).map_err(|e| {
                 VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
                     "Failed to get MsixConfigState from Snapshot: {e}"
                 ))
@@ -518,11 +523,13 @@ impl VirtioPciDevice {
         };
 
         let pci_configuration_state =
-            vm_migration::state_from_id(snapshot, pci::PCI_CONFIGURATION_ID).map_err(|e| {
-                VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
-                    "Failed to get PciConfigurationState from Snapshot: {e}"
-                ))
-            })?;
+            vm_migration::owned_state_from_id(snapshot, pci::PCI_CONFIGURATION_ID).map_err(
+                |e| {
+                    VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
+                        "Failed to get PciConfigurationState from Snapshot: {e}"
+                    ))
+                },
+            )?;
 
         let configuration = PciConfiguration::new(
             VIRTIO_PCI_VENDOR_ID,
@@ -539,11 +546,13 @@ impl VirtioPciDevice {
         );
 
         let common_config_state =
-            vm_migration::state_from_id(snapshot, VIRTIO_PCI_COMMON_CONFIG_ID).map_err(|e| {
-                VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
-                    "Failed to get VirtioPciCommonConfigState from Snapshot: {e}"
-                ))
-            })?;
+            vm_migration::owned_state_from_id(snapshot, VIRTIO_PCI_COMMON_CONFIG_ID).map_err(
+                |e| {
+                    VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
+                        "Failed to get VirtioPciCommonConfigState from Snapshot: {e}"
+                    ))
+                },
+            )?;
 
         let common_config = if let Some(common_config_state) = common_config_state {
             VirtioPciCommonConfig::new(common_config_state, Arc::clone(&device))
@@ -564,7 +573,7 @@ impl VirtioPciDevice {
 
         let state: Option<VirtioPciDeviceState> = snapshot
             .as_ref()
-            .map(|s| s.to_state())
+            .map(|s| s.to_owned_state())
             .transpose()
             .map_err(|e| {
                 VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
@@ -1358,7 +1367,7 @@ impl Snapshottable for VirtioPciDevice {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        let mut virtio_pci_dev_snapshot = Snapshot::new_from_state(&self.state())?;
+        let mut virtio_pci_dev_snapshot = Snapshot::new_from_owned_state(self.state());
 
         // Snapshot PciConfiguration
         virtio_pci_dev_snapshot

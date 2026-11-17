@@ -244,7 +244,7 @@ impl VsockChannel for VsockMuxer {
 
         // We don't know how to handle packets addressed to other CIDs. We only handle the host
         // part of the guest - host communication here.
-        if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
+        if pkt.dst_cid() != uapi::VSOCK_HOST_CID || pkt.src_cid() != self.cid {
             info!(
                 "vsock: dropping guest packet for unknown CID: {:?}",
                 pkt.hdr()
@@ -347,6 +347,14 @@ impl VsockEpollListener for VsockMuxer {
 }
 
 impl VsockBackend for VsockMuxer {
+    fn local_port_cursor(&self) -> u32 {
+        self.local_port_last
+    }
+
+    fn restore_local_port_cursor(&mut self, cursor: u32) {
+        self.local_port_last = cursor;
+    }
+
     fn connections(&self) -> Vec<(u32, u32)> {
         self.conn_map
             .keys()
@@ -1103,6 +1111,30 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_does_not_reuse_host_ports() {
+        let mut source = MuxerTestContext::new("cursor_source");
+        let (_, old_port) = source.local_connect(1024);
+        // Even a disconnected socket can still have guest TX/RST packets in
+        // flight at snapshot time. Preserve the cursor, not just live tuples.
+        source.muxer.remove_connection(ConnMapKey {
+            local_port: old_port,
+            peer_port: 1024,
+        });
+        let mut restored = MuxerTestContext::new("cursor_restored");
+        restored
+            .muxer
+            .restore_local_port_cursor(source.muxer.local_port_cursor());
+        let (_, new_port) = restored.local_connect(1024);
+        assert_ne!(new_port, old_port);
+        restored.init_pkt(old_port, 1024, uapi::VSOCK_OP_RST);
+        restored.muxer.send_pkt(&restored.pkt).unwrap();
+        assert!(restored.muxer.conn_map.contains_key(&ConnMapKey {
+            local_port: new_port,
+            peer_port: 1024,
+        }));
+    }
+
+    #[test]
     fn test_muxer_epoll_listener() {
         let ctx = MuxerTestContext::new("muxer_epoll_listener");
         assert_eq!(ctx.muxer.get_polled_fd(), ctx.muxer.epoll_file.as_raw_fd());
@@ -1153,6 +1185,12 @@ mod tests {
         assert!(!ctx.muxer.has_pending_rx());
         ctx.init_pkt(LOCAL_PORT, PEER_PORT, uapi::VSOCK_OP_REQUEST)
             .set_dst_cid(uapi::VSOCK_HOST_CID + 1);
+        ctx.send();
+        assert!(!ctx.muxer.has_pending_rx());
+
+        // A stale/forged source CID must not address a connection in this VM.
+        ctx.init_pkt(LOCAL_PORT, PEER_PORT, uapi::VSOCK_OP_REQUEST)
+            .set_src_cid(PEER_CID as u64 + 1);
         ctx.send();
         assert!(!ctx.muxer.has_pending_rx());
 

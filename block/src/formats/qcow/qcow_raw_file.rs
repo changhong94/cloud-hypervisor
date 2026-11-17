@@ -101,10 +101,25 @@ where
     <T as TryFrom<u64>>::Error: Debug,
 {
     let bytes_per_entry = size_of::<T>();
-    let mut buffer = Vec::with_capacity(table.len() * bytes_per_entry);
-    for &val in table {
-        let converted = T::try_from(val).expect("refcount values are validated on increment");
-        T::write_be(&mut buffer, converted)?;
+    // A new branch's refcount block is mostly zero. Compare zero runs in bulk
+    // instead of converting and appending tens of thousands of zero entries on
+    // every metadata flush. Still write the ENTIRE block: an entry that became
+    // zero must overwrite its previous on-disk count.
+    const RUN: usize = 256;
+    const ZERO: [u64; RUN] = [0; RUN];
+    let mut buffer = vec![0u8; table.len() * bytes_per_entry];
+    for (values, bytes) in table
+        .chunks(RUN)
+        .zip(buffer.chunks_mut(RUN * bytes_per_entry))
+    {
+        if values == &ZERO[..values.len()] {
+            continue;
+        }
+        let mut destination = bytes;
+        for &val in values {
+            let converted = T::try_from(val).expect("refcount values are validated on increment");
+            T::write_be(&mut destination, converted)?;
+        }
     }
     file.write_all_at(&buffer, offset)
 }
@@ -606,6 +621,59 @@ mod tests {
             .expect("read_refcount_block");
 
         assert_eq!(read_back, table);
+    }
+
+    #[test]
+    fn sparse_refcounts_preserve_all_widths_and_clear_old_counts() {
+        for bits in [8, 16, 32, 64] {
+            let (temp, mut qcow) = make_qcow_raw_bits(bits);
+            let count = qcow.refcount_block_entries as usize;
+            let max = u64::MAX >> (64 - bits);
+            // Include run boundaries and the last entry, then erase all of them.
+            let mut table = vec![0; count];
+            for index in [0, 255, 256, count - 1] {
+                table[index] = max;
+            }
+            qcow.write_refcount_block(TARGET_OFFSET, &table).unwrap();
+            assert_eq!(qcow.read_refcount_block(TARGET_OFFSET).unwrap(), table);
+            let expected: Vec<u8> = table
+                .iter()
+                .flat_map(|value| value.to_be_bytes()[8 - bits as usize / 8..].to_vec())
+                .collect();
+            let mut bytes = vec![0; expected.len()];
+            temp.as_file()
+                .read_exact_at(&mut bytes, TARGET_OFFSET)
+                .unwrap();
+            assert_eq!(bytes, expected);
+            table.fill(0);
+            qcow.write_refcount_block(TARGET_OFFSET, &table).unwrap();
+            assert_eq!(qcow.read_refcount_block(TARGET_OFFSET).unwrap(), table);
+        }
+    }
+
+    #[test]
+    fn sparse_refcounts_handle_partial_run_and_reject_overflow() {
+        let (_temp, mut qcow) = make_qcow_raw_bits(16);
+        let mut table = vec![0; 259];
+        table[258] = 0xabcd;
+        write_refcount::<u16>(&mut qcow.file, TARGET_OFFSET, &table).unwrap();
+        assert_eq!(
+            read_refcount::<u16>(&mut qcow.file, TARGET_OFFSET, table.len()).unwrap(),
+            table
+        );
+        table[258] = 0x10000;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_refcount::<u16>(&mut qcow.file, TARGET_OFFSET, &table).unwrap();
+            }))
+            .is_err()
+        );
+        // Validation failure must not publish any of the new block.
+        table[258] = 0xabcd;
+        assert_eq!(
+            read_refcount::<u16>(&mut qcow.file, TARGET_OFFSET, table.len()).unwrap(),
+            table
+        );
     }
 
     #[test]

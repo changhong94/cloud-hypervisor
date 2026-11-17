@@ -642,6 +642,7 @@ struct KvmMemorySlot {
 
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
+    fork_vcpus: std::sync::Mutex<HashMap<u32, Box<dyn cpu::Vcpu>>>,
     fd: Arc<VmFd>,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
@@ -762,6 +763,34 @@ impl KvmVm {
 /// let vm = hypervisor.create_vm(HypervisorVmConfig::default()).expect("new VM fd creation failed");
 /// ```
 impl vm::Vm for KvmVm {
+    fn supports_fork_reuse(&self) -> bool {
+        cfg!(target_arch = "x86_64")
+    }
+    fn park_fork_vcpus(&self, cpus: Vec<(u32, Box<dyn cpu::Vcpu>)>) -> std::io::Result<()> {
+        let mut parked = self.fork_vcpus.lock().unwrap();
+        if !parked.is_empty() {
+            return Err(std::io::Error::other("vCPUs already parked"));
+        }
+        for (id, cpu) in cpus {
+            if parked.insert(id, cpu).is_some() {
+                return Err(std::io::Error::other("Duplicate parked vCPU"));
+            }
+        }
+        Ok(())
+    }
+    fn fork_raw_fds(&self) -> Vec<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        let mut fds = vec![self.fd.as_raw_fd()];
+        fds.extend(
+            self.fork_vcpus
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|cpu| cpu.fork_raw_fd()),
+        );
+        fds
+    }
+
     #[cfg(feature = "sev_snp")]
     fn register_memory_conversion_handler(&self, handler: Arc<dyn vm::MemoryConversionHandler>) {
         self.memory_conversion_handler
@@ -899,6 +928,11 @@ impl vm::Vm for KvmVm {
         vm_ops: Option<Arc<dyn VmOps>>,
         #[cfg(target_arch = "x86_64")] msr_config_update: Option<VcpuMsrConfigUpdate>,
     ) -> vm::Result<Box<dyn cpu::Vcpu>> {
+        if let Some(mut cpu) = self.fork_vcpus.lock().unwrap().remove(&id) {
+            cpu.rebind_fork_vm_ops(vm_ops)
+                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+            return Ok(cpu);
+        }
         let fd = self
             .fd
             .create_vcpu(id as u64)
@@ -1711,6 +1745,16 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     /// let vm = hypervisor.create_vm(HypervisorVmConfig::default()).unwrap();
     /// ```
     fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn vm::Vm>> {
+        let timing = std::env::var_os("CH_FORK_TIMING")
+            .map(|_| std::time::Instant::now());
+        let mark = |phase: &str| {
+            if let Some(started) = timing {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr().lock(),
+                    "VM_KVM_INIT pid={} phase={} elapsed_ms={:.6}",
+                    std::process::id(), phase, started.elapsed().as_secs_f64() * 1000.0);
+            }
+        };
         let fd: VmFd;
 
         #[allow(unused_mut)]
@@ -1756,9 +1800,38 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             break;
         }
 
+        mark("create_vm_ioctl_done");
+        if let Some(nanoseconds) = _config.halt_poll_ns {
+            if self
+                .kvm
+                .check_extension_raw(kvm_bindings::KVM_CAP_HALT_POLL.into())
+                > 0
+            {
+                fd.enable_cap(&kvm_bindings::kvm_enable_cap {
+                    cap: kvm_bindings::KVM_CAP_HALT_POLL,
+                    args: [nanoseconds, 0, 0, 0],
+                    ..Default::default()
+                })
+                .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
+                if std::env::var_os("CH_FORK_TIMING").is_some() {
+                    use std::io::Write;
+                    let line = format!(
+                        "VM_FORK halt_poll_ns={} pid={}\n",
+                        nanoseconds,
+                        std::process::id()
+                    );
+                    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                }
+            } else {
+                log::warn!("Per-VM halt polling control is unavailable; retaining host default");
+            }
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
+            mark("halt_poll_configured");
             let msr_list = self.get_msr_list()?;
+            mark("msr_list_read");
             let num_msrs = msr_list.as_fam_struct_ref().nmsrs as usize;
             let mut msrs = vec![
                 MsrEntry {
@@ -1802,6 +1875,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             };
 
             Ok(Arc::new(KvmVm {
+                fork_vcpus: std::sync::Mutex::new(HashMap::new()),
                 fd: Arc::new(fd),
                 msrs,
                 dirty_log_slots: RwLock::new(HashMap::new()),
@@ -1818,6 +1892,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
             Ok(Arc::new(KvmVm {
+                fork_vcpus: std::sync::Mutex::new(HashMap::new()),
                 fd: Arc::new(fd),
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 memory_slots: None,
@@ -2121,6 +2196,15 @@ impl KvmVcpu {
 /// let vcpu = vm.create_vcpu(0, None, #[cfg(target_arch = "x86_64")] Default::default()).unwrap();
 /// ```
 impl cpu::Vcpu for KvmVcpu {
+    fn rebind_fork_vm_ops(&mut self, ops: Option<Arc<dyn vm::VmOps>>) -> std::io::Result<()> {
+        self.vm_ops = ops;
+        Ok(())
+    }
+    fn fork_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        Some(self.fd.as_raw_fd())
+    }
+
     ///
     /// Returns StandardRegisters with default value set
     ///
@@ -4141,6 +4225,32 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_halt_poll_override_keeps_host_default_unchanged() {
+        use super::*;
+        let host_default =
+            std::fs::read_to_string("/sys/module/kvm/parameters/halt_poll_ns").unwrap();
+        let hypervisor = KvmHypervisor::new().unwrap();
+        let fork_vm = hypervisor
+            .create_vm(HypervisorVmConfig {
+                halt_poll_ns: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        let snapshot_vm = hypervisor
+            .create_vm(HypervisorVmConfig {
+                halt_poll_ns: Some(200_000),
+                ..Default::default()
+            })
+            .unwrap();
+        let normal_vm = hypervisor.create_vm(HypervisorVmConfig::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string("/sys/module/kvm/parameters/halt_poll_ns").unwrap(),
+            host_default
+        );
+        drop((fork_vm, snapshot_vm, normal_vm));
+    }
+
     #[test]
     #[cfg(feature = "sev_snp")]
     fn test_validate_gpa_range() {

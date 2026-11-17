@@ -86,6 +86,9 @@ mod coredump;
 pub mod cpu;
 pub mod device_manager;
 pub mod device_tree;
+pub mod fork;
+mod fork_disk;
+mod fork_retirement;
 #[cfg(feature = "guest_debug")]
 mod gdb;
 #[cfg(feature = "igvm")]
@@ -115,6 +118,12 @@ type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 /// Errors associated with VMM management
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("HTTP worker exited before startup acknowledgement")]
+    HttpStartup(#[source] RecvError),
+    #[error("Failed signaling runtime cleanup")]
+    ForkWake(#[source] io::Error),
+    #[error("Failed restoring forked VM")]
+    ForkRestore(#[source] VmError),
     /// API request receive error
     #[error("Error receiving API request")]
     ApiRequestRecv(#[source] RecvError),
@@ -260,6 +269,7 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
             mem_size: _value.memory.total_size(),
             #[cfg(feature = "sev_snp")]
             vmsa_features: 0,
+            halt_poll_ns: None,
             nested: _value.cpus.nested,
             smt_enabled: _value
                 .cpus
@@ -481,6 +491,9 @@ pub fn start_vmm_thread(
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     no_shutdown: bool,
     landlock_enable: bool,
+    fork_enabled: bool,
+    restore_fork: Option<fork::ForkState>,
+    fork_operations: fork::ForkOperations,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
     let gdb_hw_breakpoints = hypervisor.get_guest_debug_hw_bps();
@@ -491,13 +504,23 @@ pub fn start_vmm_thread(
     #[cfg(feature = "guest_debug")]
     let gdb_vm_debug_event = vm_debug_event.try_clone().map_err(Error::EventFdClone)?;
 
+    let restore_trace = restore_fork.as_ref().and_then(fork::ForkState::trace);
     let api_event_clone = api_event.try_clone().map_err(Error::EventFdClone)?;
     let hypervisor_type = hypervisor.hypervisor_type();
 
     // Retrieve seccomp filter
-    let vmm_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::Vmm, Some(hypervisor_type))
-        .map_err(Error::CreateSeccompFilter)?;
+    let vmm_seccomp_filter = get_seccomp_filter(
+        seccomp_action,
+        if fork_enabled {
+            Thread::ForkVmm
+        } else {
+            Thread::Vmm
+        },
+        Some(hypervisor_type),
+    )
+    .map_err(Error::CreateSeccompFilter)?;
 
+    let (startup_sender, startup_receiver) = channel();
     let vmm_seccomp_action = seccomp_action.clone();
     let thread = {
         let exit_event = exit_event.try_clone().map_err(Error::EventFdClone)?;
@@ -509,6 +532,8 @@ pub fn start_vmm_thread(
                     apply_filter(&vmm_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
                 }
 
+                fork::set_trace(restore_fork.as_ref().and_then(fork::ForkState::trace));
+                fork::trace_point("vmm_thread_start");
                 let mut vmm = Vmm::new(
                     vmm_version,
                     api_event,
@@ -522,13 +547,27 @@ pub fn start_vmm_thread(
                     no_shutdown,
                 )?;
 
-                vmm.setup_signal_handler(landlock_enable)?;
-
-                vmm.control_loop(
-                    &api_receiver,
-                    #[cfg(feature = "guest_debug")]
-                    &gdb_receiver,
-                )
+                fork::trace_point("vmm_initialized");
+                let result = (|| {
+                    vmm.fork_enabled = fork_enabled;
+                    vmm.fork_operations = fork_operations;
+                    vmm.setup_signal_handler(landlock_enable)?;
+                    if let Some(state) = restore_fork {
+                        vmm.restore_fork(state).map_err(Error::ForkRestore)?;
+                    }
+                    let _ = startup_sender.send(());
+                    vmm.control_loop(
+                        &api_receiver,
+                        #[cfg(feature = "guest_debug")]
+                        &gdb_receiver,
+                    )
+                })();
+                // This also runs on a restore/control-loop error. A signal
+                // worker must never be detached across a supervisor restart.
+                vmm.stop_threads()?;
+                fork::trace_point("vmm_workers_joined");
+                result?;
+                Ok(vmm.fork_state.take())
             })
             .map_err(Error::VmmThreadSpawn)?
     };
@@ -550,28 +589,48 @@ pub fn start_vmm_thread(
         None => None,
     };
 
-    let http_api_handle = if let Some(http_path) = http_path {
-        Some(api::start_http_path_thread(
-            http_path,
-            api_event_clone,
-            api_sender,
-            seccomp_action,
-            exit_event,
-            landlock_enable,
-        )?)
-    } else if let Some(http_fd) = http_fd {
-        Some(api::start_http_fd_thread(
-            http_fd,
-            api_event_clone,
-            api_sender,
-            seccomp_action,
-            exit_event,
-            landlock_enable,
-        )?)
-    } else {
-        None
+    let cleanup_exit = exit_event.try_clone().map_err(Error::EventFdClone)?;
+    let http_result: Result<Option<HttpApiHandle>> = (|| {
+        let handle = if let Some(http_path) = http_path {
+            Some(api::start_http_path_thread(
+                http_path,
+                api_event_clone,
+                api_sender,
+                seccomp_action,
+                exit_event,
+                landlock_enable,
+            )?)
+        } else if let Some(http_fd) = http_fd {
+            Some(api::start_http_fd_thread(
+                http_fd,
+                api_event_clone,
+                api_sender,
+                seccomp_action,
+                exit_event,
+                landlock_enable,
+            )?)
+        } else {
+            None
+        };
+        Ok(handle)
+    })();
+    let http_api_handle = match http_result {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Binding can fail after a restored VM has already spawned workers.
+            // Stop/join them before reporting child startup failure to its parent.
+            cleanup_exit.write(1).map_err(Error::ForkWake)?;
+            let _ = thread.join().map_err(Error::ThreadCleanup)?;
+            #[cfg(feature = "dbus_api")]
+            if let Some(chs) = dbus_shutdown_chs {
+                api::dbus::dbus_api_graceful_shutdown(chs);
+            }
+            return Err(error);
+        }
     };
-
+    if let Some(trace) = &restore_trace {
+        trace.mark("api_bound");
+    }
     #[cfg(feature = "guest_debug")]
     if let Some(debug_path) = debug_path {
         let target = gdb::GdbStub::new(
@@ -586,6 +645,15 @@ pub fn start_vmm_thread(
             .map_err(Error::GdbThreadSpawn)?;
     }
 
+    if let Err(startup_error) = startup_receiver.recv() {
+        if let Some(handle) = http_api_handle {
+            api::http::http_api_graceful_shutdown(handle)?;
+        }
+        return match thread.join().map_err(Error::ThreadCleanup)? {
+            Err(error) => Err(error),
+            Ok(_) => Err(Error::ApiRequestRecv(startup_error)),
+        };
+    }
     Ok(VmmThreadHandle {
         thread_handle: thread,
         #[cfg(feature = "dbus_api")]
@@ -650,7 +718,7 @@ impl VmmVersionInfo {
 }
 
 pub struct VmmThreadHandle {
-    pub thread_handle: thread::JoinHandle<Result<()>>,
+    pub thread_handle: thread::JoinHandle<Result<Option<fork::ForkState>>>,
     #[cfg(feature = "dbus_api")]
     pub dbus_shutdown_chs: Option<DBusApiShutdownChannels>,
     pub http_api_handle: Option<HttpApiHandle>,
@@ -696,6 +764,12 @@ impl VmOwnership {
     }
 }
 
+struct PreparedRestoreVm {
+    profile: hypervisor::HypervisorVmConfig,
+    cpus: serde_json::Value,
+    vm: Arc<dyn hypervisor::Vm>,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -708,6 +782,13 @@ pub struct Vmm {
     vm_debug_evt: EventFd,
     version: VmmVersionInfo,
     vm: VmOwnership,
+    prepared_restore_vm: Option<PreparedRestoreVm>,
+    fork_enabled: bool,
+    fork_operations: fork::ForkOperations,
+    fork_state: Option<fork::ForkState>,
+    fork_pause_started: Option<std::time::Instant>,
+    disk_merge: Option<Arc<fork_disk::MergeJob>>,
+    disk_retirement: Option<Arc<fork_retirement::DiskRetirementJob>>,
     vm_config: Option<Arc<Mutex<VmConfig>>>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
@@ -946,6 +1027,13 @@ impl Vmm {
             vm_debug_evt,
             version: vmm_version,
             vm: VmOwnership::None,
+            prepared_restore_vm: None,
+            fork_enabled: false,
+            fork_operations: Arc::default(),
+            fork_state: None,
+            fork_pause_started: None,
+            disk_merge: None,
+            disk_retirement: None,
             vm_config: None,
             seccomp_action,
             hypervisor,
@@ -2089,7 +2177,9 @@ impl Vmm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
+                let _restore_trace = crate::fork::restore_trace(source_url);
                 let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+                crate::fork::trace_point("snapshot_decoded");
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
 
@@ -2097,6 +2187,24 @@ impl Vmm {
                 self.vm_check_cpuid_compatibility(&vm_config, &vm_snapshot.common_cpuid)
                     .map_err(VmError::Restore)?;
 
+                crate::fork::trace_point("cpuid_validated");
+                let reused_vm = if let Some(prepared) = &self.prepared_restore_vm {
+                    let config = vm_config.lock().unwrap();
+                    let mut profile: hypervisor::HypervisorVmConfig = (&*config).into();
+                    profile.halt_poll_ns = Some(200_000);
+                    if prepared.profile != profile
+                        || prepared.cpus != serde_json::to_value(&config.cpus).unwrap()
+                        || memory_restore_mode != MemoryRestoreMode::CopyOnWrite
+                    {
+                        return Err(VmError::ForkUnsupported(
+                            "Prepared KVM profile does not match restore".into(),
+                        ));
+                    }
+                    drop(config);
+                    Some(self.prepared_restore_vm.take().unwrap().vm)
+                } else {
+                    None
+                };
                 self.vm_config = Some(Arc::clone(&vm_config));
 
                 // Always re-populate the 'console_info' based on the new 'vm_config'
@@ -2119,7 +2227,7 @@ impl Vmm {
                     .try_clone()
                     .map_err(VmError::EventFdClone)?;
 
-                let mut vm = Vm::new(
+                let mut vm = Vm::new_with_inherited_memory(
                     vm_config,
                     exit_evt,
                     reset_evt,
@@ -2136,6 +2244,8 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    None,
+                    reused_vm,
                 )?;
 
                 if self
@@ -2152,7 +2262,9 @@ impl Vmm {
 
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
+                crate::fork::trace_point("restore_objects_ready");
                 vm.restore()?;
+                crate::fork::trace_point("restored_vcpus_started");
                 self.vm = VmOwnership::Owned(vm);
                 Ok(())
             }
@@ -2383,6 +2495,12 @@ impl Vmm {
             }
         }
 
+        Ok(())
+    }
+
+    fn stop_threads(&mut self) -> Result<()> {
+        self.disk_merge.take();
+        self.disk_retirement.take();
         // Trigger the termination of the signal_handler thread
         if let Some(signals) = self.signals.take() {
             signals.close();
@@ -2487,6 +2605,76 @@ fn update_memory_zones(
 }
 
 impl RequestHandler for Vmm {
+    fn vm_fork_status(&mut self) -> Vec<fork::ForkOperation> {
+        fork::operations_snapshot(&self.fork_operations)
+    }
+
+    fn vm_fork(
+        &mut self,
+        request: api::VmForkConfig,
+    ) -> result::Result<fork::ForkOperation, VmError> {
+        self.prepare_fork(request)
+    }
+
+    fn vmm_prepare(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            feature = "kvm",
+            not(any(feature = "tdx", feature = "sev_snp"))
+        ))]
+        {
+            if !matches!(self.vm, VmOwnership::None)
+                || self.vm_config.is_some()
+                || self.prepared_restore_vm.is_some()
+            {
+                return Err(VmError::VmAlreadyCreated);
+            }
+            let mut config = config;
+            config.validate().map_err(VmError::ConfigValidation)?;
+            let mut profile: hypervisor::HypervisorVmConfig = config.as_ref().into();
+            profile.halt_poll_ns = Some(200_000);
+            let msrs = arch::x86_64::generate_required_msr_updates(
+                self.hypervisor.as_ref(),
+                config.cpus.profile,
+                config.cpus.kvm_hyperv,
+                config.cpus.nested,
+            )
+            .map_err(|e| VmError::ForkUnsupported(format!("Preparing MSR profile: {e}")))?;
+            let vm = Vm::create_hypervisor_vm(self.hypervisor.as_ref(), profile)?;
+            if !vm.supports_fork_reuse() {
+                return Err(VmError::ForkUnsupported(
+                    "Hypervisor cannot retain prepared vCPUs".into(),
+                ));
+            }
+            let mut cpus = Vec::new();
+            for id in 0..u32::from(config.cpus.boot_vcpus) {
+                let cpu = vm
+                    .create_vcpu(id, None, msrs.clone())
+                    .map_err(|e| VmError::ForkUnsupported(format!("Preparing vCPU: {e}")))?;
+                cpus.push((id, cpu));
+            }
+            vm.park_fork_vcpus(cpus)
+                .map_err(|e| VmError::ForkUnsupported(format!("Parking prepared vCPUs: {e}")))?;
+            self.prepared_restore_vm = Some(PreparedRestoreVm {
+                profile,
+                cpus: serde_json::to_value(&config.cpus).unwrap(),
+                vm,
+            });
+            return Ok(());
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            feature = "kvm",
+            not(any(feature = "tdx", feature = "sev_snp"))
+        )))]
+        {
+            let _ = config;
+            Err(VmError::ForkUnsupported(
+                "KVM preparation requires ordinary x86_64 KVM".into(),
+            ))
+        }
+    }
+
     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Migration { .. } => return Err(VmError::VmMigrating),
@@ -2495,7 +2683,7 @@ impl RequestHandler for Vmm {
 
         // We only store the passed VM config.
         // The VM will be created when being asked to boot it.
-        if self.vm_config.is_some() {
+        if self.vm_config.is_some() || self.prepared_restore_vm.is_some() {
             return Err(VmError::VmAlreadyCreated);
         }
 
@@ -2607,7 +2795,8 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
-        match self.vm {
+        fork::trace_point("resume_begin");
+        let result = match self.vm {
             VmOwnership::Owned(ref mut vm) => vm.resume().map_err(VmError::Resume),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
@@ -2617,7 +2806,24 @@ impl RequestHandler for Vmm {
                     Err(VmError::VmNotRunning)
                 }
             }
+        };
+        if result.is_ok() {
+            fork::trace_point("resume_done");
+            fork::set_trace(None);
+            if let Some(job) = &self.disk_retirement {
+                job.start();
+            }
+            if let Some(job) = &self.disk_merge {
+                job.start();
+            }
+            if let Some(started) = self.fork_pause_started.take() {
+                fork::log_line(format_args!(
+                    "VM_FORK pause_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
         }
+        result
     }
 
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
@@ -2901,6 +3107,9 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+        self.prepared_restore_vm.take();
+        self.disk_merge.take();
+        self.disk_retirement.take();
         if self.vm_config.is_none() {
             return Ok(());
         }

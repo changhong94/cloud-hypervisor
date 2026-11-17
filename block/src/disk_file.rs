@@ -84,11 +84,30 @@ pub trait Resizable: Send + Debug {
     fn resize(&mut self, size: u64) -> BlockResult<()>;
 }
 
+/// Terminal close work retained after a quiesced, durably flushed disk is sealed.
+/// The original writer must never be used again. Only the pre-fork owner may
+/// finalize; an inherited child handle only releases its file descriptors.
+pub trait ForkRetirement: Send {
+    fn finish(&self) -> BlockResult<()>;
+}
+
 /// Flush of format metadata cached in memory.
 ///
 /// Default is a no-op for formats that keep no metadata cache
 /// (e.g. raw, fixed vhd).
 pub trait MetadataSync: Send + Debug {
+    /// Prepare only the immutable backing prefix while the guest runs. Publish
+    /// this reader only after the live writer is checkpointed and retired.
+    fn prepare_fork_backing(
+        &self,
+    ) -> BlockResult<Option<crate::formats::qcow::PreparedQcowBacking>> {
+        Ok(None)
+    }
+    /// Called only after draining writes and sync_metadata, before destroying
+    /// the old device. Retains the terminal close work across the host fork.
+    fn defer_fork_shutdown(&self) -> Option<Box<dyn ForkRetirement>> {
+        None
+    }
     /// Flushes format metadata cached in memory (e.g. qcow2 L2/refcount
     /// tables) to the underlying file.
     ///

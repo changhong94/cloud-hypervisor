@@ -152,6 +152,12 @@ pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
         Vec::new()
     }
     fn queue_rst_for_connections(&mut self, _conns: Vec<(u32, u32)>) {}
+
+    /// Preserve the allocation cursor across restore without restoring sockets.
+    fn local_port_cursor(&self) -> u32 {
+        (1 << 30) - 1
+    }
+    fn restore_local_port_cursor(&mut self, _cursor: u32) {}
 }
 
 #[cfg(any(test, fuzzing))]
@@ -355,6 +361,7 @@ pub mod tests {
                 guest_txvq,
                 guest_evvq,
                 handler: VsockEpollHandler {
+                    reset_pending: false,
                     mem: GuestMemoryAtomic::new(self.mem.clone()),
                     queues,
                     queue_evts,

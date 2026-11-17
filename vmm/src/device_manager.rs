@@ -2750,6 +2750,74 @@ impl DeviceManager {
         Ok(tpm)
     }
 
+    pub(crate) fn prepare_fork_backings(
+        &self,
+    ) -> std::io::Result<Vec<block::formats::qcow::PreparedQcowBacking>> {
+        let mut backings = Vec::new();
+        for dev in &self.block_devices {
+            if let Some(backing) = dev
+                .lock()
+                .unwrap()
+                .prepare_fork_backing()
+                .map_err(std::io::Error::other)?
+            {
+                backings.push(backing);
+            }
+        }
+        Ok(backings)
+    }
+
+    pub(crate) fn preflush_fork_disks(&self) -> std::io::Result<()> {
+        for dev in &self.block_devices {
+            dev.lock()
+                .unwrap()
+                .preflush_fork()
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// A retained KVM must not keep the old transport event registrations.
+    /// Only validated local virtio devices are supported by the fork profile.
+    pub(crate) fn detach_fork_events(&self) -> std::io::Result<()> {
+        for node in self.device_tree.lock().unwrap().pci_devices() {
+            if let Some(PciDeviceHandle::Virtio(device)) = &node.pci_device_handle {
+                let device = device.lock().unwrap();
+                let base = node
+                    .resources
+                    .iter()
+                    .find_map(|resource| match resource {
+                        Resource::PciBar { index, base, .. }
+                            if *index == VIRTIO_CONFIG_BAR_INDEX =>
+                        {
+                            Some(*base)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| std::io::Error::other("Missing fork PCI BAR"))?;
+                for (event, address) in device.ioeventfds(base) {
+                    self.address_manager
+                        .vm
+                        .unregister_ioevent(event, &IoEventAddress::Mmio(address))
+                        .map_err(std::io::Error::other)?;
+                }
+                device.detach_fork_irqfds()?;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ioapic) = &self.interrupt_controller {
+            ioapic.lock().unwrap().detach_fork_irqfds()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_fork_disks(&self) -> Vec<Box<dyn block::disk_file::ForkRetirement>> {
+        self.block_devices
+            .iter()
+            .filter_map(|dev| dev.lock().unwrap().retain_fork_close())
+            .collect()
+    }
+
     /// Tries to acquire advisory locks for all disk images.
     ///
     /// This should only be called when a VM boots or VM state is restored.
@@ -2781,9 +2849,15 @@ impl DeviceManager {
 
     fn make_virtio_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
         // Create "standard" virtio devices (net/block/rng)
+        crate::fork::trace_point("block_create_begin");
         self.make_virtio_block_devices(snapshot)?;
+        crate::fork::trace_point("block_create_done");
+        crate::fork::trace_point("net_create_begin");
         self.make_virtio_net_devices(snapshot)?;
+        crate::fork::trace_point("net_create_done");
+        crate::fork::trace_point("rng_create_begin");
         self.make_virtio_rng_devices(snapshot)?;
+        crate::fork::trace_point("rng_create_done");
 
         // Add generic vhost-user if required
         self.make_generic_vhost_user_devices(snapshot)?;
@@ -2795,7 +2869,9 @@ impl DeviceManager {
         self.make_virtio_pmem_devices(snapshot)?;
 
         // Add virtio-vsock if required
+        crate::fork::trace_point("vsock_create_begin");
         self.make_virtio_vsock_devices(snapshot)?;
+        crate::fork::trace_point("vsock_create_done");
 
         self.make_virtio_mem_devices(snapshot)?;
 
@@ -2879,6 +2955,7 @@ impl DeviceManager {
                 .as_ref()
                 .ok_or(DeviceManagerError::NoDiskPath)?;
 
+            crate::fork::trace_point("disk_open_begin");
             let disk = open_disk(
                 &DiskOpenOptions {
                     path: disk_path,
@@ -2892,6 +2969,7 @@ impl DeviceManager {
                 disk_cfg.image_type,
             )
             .map_err(DeviceManagerError::Disk)?;
+            crate::fork::trace_point("disk_open_done");
 
             if let Some(guest_block_size) = disk_cfg.guest_block_size
                 && disk_cfg.direct
@@ -2967,7 +3045,7 @@ impl DeviceManager {
                 self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                state_from_id(snapshot, id.as_str())
+                vm_migration::owned_state_from_id(snapshot, id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
                 queue_affinity,
                 disk_cfg.sparse,
@@ -3083,7 +3161,7 @@ impl DeviceManager {
                 vhost_user_net as Arc<Mutex<dyn Migratable>>,
             )
         } else {
-            let state = state_from_id(snapshot, id.as_str())
+            let state = vm_migration::owned_state_from_id(snapshot, id.as_str())
                 .map_err(DeviceManagerError::RestoreGetState)?;
             let guest_mac = *net_cfg.mac.get_or_insert_with(MacAddr::local_random);
 
@@ -3660,7 +3738,7 @@ impl DeviceManager {
                 self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                state_from_id(snapshot, id.as_str())
+                vm_migration::owned_state_from_id(snapshot, id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
             .map_err(DeviceManagerError::CreateVirtioVsock)?,
@@ -6780,13 +6858,24 @@ impl BusDevice for DeviceManager {
     }
 }
 
+impl DeviceManager {
+    /// Whole-VM fork teardown retains this mapping until the final KVM VM fd
+    /// closes. Hot unplug and ordinary teardown still unregister it explicitly.
+    #[cfg(not(target_arch = "riscv64"))]
+    pub(crate) fn take_fork_vmgenid_mapping(&mut self) -> Option<UserspaceMapping> {
+        self.vmgenid_mapping.take()
+    }
+}
+
 impl Drop for DeviceManager {
     fn drop(&mut self) {
+        crate::fork::trace_point("device_manager_drop_begin");
         // Explicitly clear the regions owned by this device to ensure
         // that they are dropped and unmapped before the container is cleared.
         // See eject_device() for the device hot-unplug equivalent.
         self.mmio_regions.lock().unwrap().clear();
 
+        crate::fork::trace_point("mmio_regions_cleared");
         // Remove the VM Generation ID memory slot created in add_vmgenid_device.
         #[cfg(not(target_arch = "riscv64"))]
         if let Some(mapping) = self.vmgenid_mapping.take() {
@@ -6808,10 +6897,12 @@ impl Drop for DeviceManager {
             }
         }
 
+        crate::fork::trace_point("vmgenid_unmapped");
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();
         }
 
+        crate::fork::trace_point("device_threads_joined");
         if let Some(termios) = *self.original_termios_opt.lock().unwrap() {
             // SAFETY: FFI call
             let _ = unsafe { tcsetattr(stdout().lock().as_raw_fd(), TCSANOW, &termios) };

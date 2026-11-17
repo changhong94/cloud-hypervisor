@@ -171,3 +171,13 @@ unnecessary_semicolon = "deny"
 # `level = warn` is irrelevant here but mandatory for rustc/cargo
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(devcli_testenv)'] }
 unreachable_pub = "deny"
+
+# Restore and device dispatch are latency-sensitive; keep dependencies compact.
+[profile.release.package.vmm]
+opt-level = 3
+
+[profile.release.package.virtio-devices]
+opt-level = 3
+
+[profile.release.package.hypervisor]
+opt-level = 3
