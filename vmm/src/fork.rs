@@ -299,9 +299,12 @@ impl Drop for RestoreTrace {
 }
 pub(crate) fn restore_trace(operation: &str) -> Option<RestoreTrace> {
     std::env::var_os("CH_RESTORE_TIMING")?;
-    let previous = TRACE.with(|slot| slot.replace(Some(ForkTrace {
-        started: Instant::now(), operation: operation.to_owned(),
-    })));
+    let previous = TRACE.with(|slot| {
+        slot.replace(Some(ForkTrace {
+            started: Instant::now(),
+            operation: operation.to_owned(),
+        }))
+    });
     trace_point("restore_begin");
     Some(RestoreTrace(previous))
 }
@@ -342,8 +345,20 @@ impl ForkTrace {
             .unwrap_or(0);
         // SAFETY: gettid has no pointer arguments or side effects.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        // Correlate fork stages with host-side client/RPC CLOCK_MONOTONIC.
+        // This diagnostic timestamp is not used for VM lifecycle decisions.
+        let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes the writable timespec on success.
+        let mono_ns =
+            if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } == 0 {
+                // SAFETY: the successful call initialized both timespec fields.
+                let now = unsafe { now.assume_init() };
+                now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+            } else {
+                0
+            };
         let line = format!(
-            "VM_FORK stage op={} pid={} phase={} elapsed_ms={:.3} cpu_ms={cpu_ms:.3} voluntary={voluntary} involuntary={involuntary} tid={tid} run_ns={run_ns} wait_ns={wait_ns}\n",
+            "VM_FORK stage op={} pid={} phase={} elapsed_ms={:.3} cpu_ms={cpu_ms:.3} voluntary={voluntary} involuntary={involuntary} tid={tid} run_ns={run_ns} wait_ns={wait_ns} mono_ns={mono_ns}\n",
             self.operation,
             process::id(),
             phase,
@@ -530,6 +545,7 @@ fn rewrite_net_mac(snapshot: &mut Snapshot, id: &str, mac: &[u8]) -> io::Result<
             let mut state: virtio_devices::net::NetState =
                 child.to_owned_state().map_err(io::Error::other)?;
             state.config.mac.copy_from_slice(mac);
+            state.fork_identity_reset = true;
             child.snapshot_data = Some(vm_migration::SnapshotData::new_from_owned_state(state));
             return Ok(true);
         }
@@ -1655,6 +1671,7 @@ mod tests {
             config: Default::default(),
             queue_size: vec![256, 256, 256, 256],
             curr_queue_pairs: Some(1),
+            fork_identity_reset: false,
         };
         net.config.mac = [2, 0, 0, 0, 0, 1];
         let mut parent = Snapshot::default();
@@ -1668,6 +1685,8 @@ mod tests {
         assert_eq!(original.config.mac, [2, 0, 0, 0, 0, 1]);
         assert_eq!(derived.config.mac, [2, 0, 0, 0, 0, 2]);
         assert_eq!(derived.queue_size, original.queue_size);
+        assert!(!original.fork_identity_reset);
+        assert!(derived.fork_identity_reset);
     }
 
     #[test]

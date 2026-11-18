@@ -95,6 +95,13 @@ impl NetCtrlEpollHandler {
             self.announce_retry_timer.as_raw_fd(),
             RETRY_ANNOUNCEMENTS_EVENT,
         )?;
+        // Host eventfd counters are not part of a virtqueue snapshot. A restored
+        // guest can already be waiting for a control reply and never kick again.
+        // Schedule a scan; EpollHelper still waits for resume before accessing
+        // guest memory, so this preserves the device pause barrier.
+        self.queue_evt.write(1).map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to rearm control queue: {e:?}"))
+        })?;
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -521,6 +528,10 @@ pub struct NetState {
     pub queue_size: Vec<u16>,
     #[serde(default)]
     pub curr_queue_pairs: Option<u16>,
+    /// One-shot restore instruction for a fork into a new network identity.
+    /// The controller keeps the network gated until guest identity reset completes.
+    #[serde(default)]
+    pub fork_identity_reset: bool,
 }
 
 impl Net {
@@ -561,15 +572,17 @@ impl Net {
         let (avail_features, acked_features, config, queue_sizes, paused, announce_pending) =
             if let Some(state) = state {
                 info!("Restoring virtio-net {id}");
-                // Always mark the announcement pending if the device was restored
-                // so the device announces itself.
+                // Migration preserves identity and must announce it. A fork must
+                // first replace the inherited identity under its network gate.
+                // Announcing here can race guest link-down: virtnet_close waits
+                // for config_work while netdev_notify_peers waits for RTNL.
                 (
                     state.avail_features,
                     state.acked_features,
                     state.config,
                     state.queue_size,
                     true,
-                    true,
+                    !state.fork_identity_reset,
                 )
             } else {
                 let mut avail_features = (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << VIRTIO_F_VERSION_1);
@@ -758,6 +771,8 @@ impl Net {
             config: self.config,
             queue_size: self.common.queue_sizes.clone(),
             curr_queue_pairs: Some(self.curr_queue_pairs.load(Ordering::Acquire)),
+            // Do not carry a consumed fork instruction into a later migration.
+            fork_identity_reset: false,
         }
     }
 
@@ -1296,6 +1311,75 @@ mod tests {
     }
 
     #[test]
+    fn test_restored_control_queue_is_drained_after_resume_without_guest_kick() {
+        use std::time::Instant;
+
+        use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+        use vm_memory::{Bytes, GuestAddress};
+        use vm_virtio::queue::testing::VirtQueue as GuestQ;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20_0000)]).unwrap();
+        let guest_q = GuestQ::new(GuestAddress(0x10_0000), &mem, 2);
+        let queue = guest_q.create_queue();
+        guest_q.dtable[0].set(0x11_0000, 2, VRING_DESC_F_NEXT as u16, 1);
+        guest_q.dtable[1].set(0x11_1000, 1, VRING_DESC_F_WRITE as u16, 0);
+        // A saved ANNOUNCE_ACK is available, but its host eventfd is fresh/empty.
+        mem.write_slice(&[3, 0], GuestAddress(0x11_0000)).unwrap();
+        mem.write_obj(0xff_u8, GuestAddress(0x11_1000)).unwrap();
+        guest_q.avail.ring[0].set(0);
+        guest_q.avail.idx.set(1);
+        let memory = GuestMemoryAtomic::new(mem);
+        let announce = AnnouncementState::new(true).unwrap();
+        let pending = Arc::clone(&announce.pending);
+        let kill = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let paused = Arc::new(AtomicBool::new(true));
+        let worker_paused = Arc::clone(&paused);
+        let mut handler = NetCtrlEpollHandler {
+            mem: memory.clone(),
+            kill_evt: kill.try_clone().unwrap(),
+            pause_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            ctrl_q: CtrlQueue::new(Vec::new(), pending.clone(), 1, Arc::new(AtomicU16::new(1))),
+            queue_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            queue,
+            access_platform: None,
+            interrupt_cb: Arc::new(TestInterrupt::new()),
+            queue_index: 2,
+            announce_evt: announce.evt.try_clone().unwrap(),
+            announce_retry_timer: TimerFd::new().unwrap(),
+            announcer: Announcer::new(&announce, Vec::new().into()),
+        };
+        let worker = std::thread::spawn(move || handler.run_ctrl(&worker_paused, &Barrier::new(1)));
+        std::thread::sleep(Duration::from_millis(10));
+        let untouched = memory
+            .memory()
+            .read_obj::<u8>(GuestAddress(0x11_1000))
+            .unwrap();
+        paused.store(false, Ordering::SeqCst);
+        worker.thread().unpark();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pending.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        kill.write(1).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            untouched, 0xff,
+            "must not process guest memory before resume"
+        );
+        assert!(
+            !pending.load(Ordering::Acquire),
+            "restore must not depend on a new guest kick"
+        );
+        assert_eq!(
+            memory
+                .memory()
+                .read_obj::<u8>(GuestAddress(0x11_1000))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn test_status_feature_reports_link_up() {
         // The current implementation should always report "link up" if
         // VIRTIO_NET_F_STATUS has been negotiated.
@@ -1564,6 +1648,7 @@ mod tests {
 
         let state: NetState = snapshot.to_state().unwrap();
         assert_eq!(state.curr_queue_pairs, None);
+        assert!(!state.fork_identity_reset);
     }
 
     #[test]
@@ -1571,6 +1656,7 @@ mod tests {
         let mut net = test_net(0, None).unwrap();
         net.curr_queue_pairs.store(4, Ordering::Release);
         assert_eq!(net.state().curr_queue_pairs, Some(4));
+        assert!(!net.state().fork_identity_reset);
 
         net.reset();
         assert_eq!(net.state().curr_queue_pairs, Some(1));
