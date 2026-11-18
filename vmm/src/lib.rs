@@ -2635,8 +2635,25 @@ impl RequestHandler for Vmm {
             {
                 return Err(VmError::VmAlreadyCreated);
             }
+            let mut previous = std::time::Instant::now();
+            let trace = std::env::var_os("CH_FORK_TIMING").is_some();
+            let mut mark = |phase: &str| {
+                let now = std::time::Instant::now();
+                if trace {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "VM_POOL_PREPARE pid={} phase={} elapsed_ms={:.6}",
+                        std::process::id(),
+                        phase,
+                        (now - previous).as_secs_f64() * 1000.0
+                    );
+                }
+                previous = now;
+            };
             let mut config = config;
             config.validate().map_err(VmError::ConfigValidation)?;
+            mark("validate");
             let mut profile: hypervisor::HypervisorVmConfig = config.as_ref().into();
             profile.halt_poll_ns = Some(200_000);
             let msrs = arch::x86_64::generate_required_msr_updates(
@@ -2646,7 +2663,9 @@ impl RequestHandler for Vmm {
                 config.cpus.nested,
             )
             .map_err(|e| VmError::ForkUnsupported(format!("Preparing MSR profile: {e}")))?;
+            mark("msr_profile");
             let vm = Vm::create_hypervisor_vm(self.hypervisor.as_ref(), profile)?;
+            mark("kvm_vm");
             if !vm.supports_fork_reuse() {
                 return Err(VmError::ForkUnsupported(
                     "Hypervisor cannot retain prepared vCPUs".into(),
@@ -2657,10 +2676,12 @@ impl RequestHandler for Vmm {
                 let cpu = vm
                     .create_vcpu(id, None, msrs.clone())
                     .map_err(|e| VmError::ForkUnsupported(format!("Preparing vCPU: {e}")))?;
+                mark("vcpu");
                 cpus.push((id, cpu));
             }
             vm.park_fork_vcpus(cpus)
                 .map_err(|e| VmError::ForkUnsupported(format!("Parking prepared vCPUs: {e}")))?;
+            mark("park_vcpus");
             self.prepared_restore_vm = Some(PreparedRestoreVm {
                 profile,
                 cpus: serde_json::to_value(&config.cpus).unwrap(),
