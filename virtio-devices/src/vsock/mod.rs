@@ -362,6 +362,8 @@ pub mod tests {
                 guest_evvq,
                 handler: VsockEpollHandler {
                     reset_pending: false,
+                    reset_ack_avail: None,
+                    backend_registered: false,
                     mem: GuestMemoryAtomic::new(self.mem.clone()),
                     queues,
                     queue_evts,

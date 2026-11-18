@@ -10,7 +10,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, RwLock};
 use std::{fs, io, result};
 
@@ -96,6 +96,8 @@ enum Error {
 ///
 pub(crate) struct VsockEpollHandler<B: VsockBackend> {
     pub reset_pending: bool,
+    pub reset_ack_avail: Option<u16>,
+    pub backend_registered: bool,
     pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
     pub queues: Vec<Queue>,
     pub queue_evts: Vec<EventFd>,
@@ -130,6 +132,13 @@ where
                             .write_slice(&0u32.to_le_bytes(), desc.addr())
                             .is_ok()
                 });
+            if valid {
+                // Linux returns this event buffer only after updating its CID
+                // and resetting connected sockets. Capture before publishing it.
+                self.reset_ack_avail = Some(self.queues[2]
+                    .avail_idx(chain.memory(), Ordering::Acquire)
+                    .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset avail: {e}")))?.0);
+            }
             self.queues[2]
                 .add_used(chain.memory(), head, if valid { 4 } else { 0 })
                 .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset queue: {e}")))?;
@@ -141,6 +150,17 @@ where
             }
         }
         Ok(())
+    }
+
+    fn reset_complete(&mut self) -> result::Result<bool, EpollHelperError> {
+        if self.reset_pending { return Ok(false); }
+        if let Some(before) = self.reset_ack_avail {
+            let current = self.queues[2].avail_idx(&*self.mem.memory(), Ordering::Acquire)
+                .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset acknowledgement: {e}")))?.0;
+            if current == before { return Ok(false); }
+            self.reset_ack_avail = None;
+        }
+        Ok(true)
     }
 
     /// Signal the guest driver that we've used some virtio buffers that it had previously made
@@ -251,7 +271,12 @@ where
         helper.add_event(self.queue_evts[0].as_raw_fd(), RX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[1].as_raw_fd(), TX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[2].as_raw_fd(), EVT_QUEUE_EVENT)?;
-        helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
+        // Do not poll the listener until the guest has consumed RESET. Keeping
+        // an unread level-triggered listener registered would spin while paused.
+        if !self.reset_pending && self.reset_ack_avail.is_none() {
+            helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
+            self.backend_registered = true;
+        }
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -264,7 +289,7 @@ where
 {
     fn handle_event(
         &mut self,
-        _helper: &mut EpollHelper,
+        helper: &mut EpollHelper,
         event: &epoll::Event,
     ) -> result::Result<(), EpollHelperError> {
         let evset = match epoll::Events::from_bits(event.events) {
@@ -277,7 +302,13 @@ where
         };
 
         self.process_reset()?;
+        let ready = self.reset_complete()?;
+        if ready && !self.backend_registered {
+            helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
+            self.backend_registered = true;
+        }
         let ev_type = event.data as u16;
+        if ev_type == BACKEND_EVENT && !ready { return Ok(()); }
         match ev_type {
             RX_QUEUE_EVENT => {
                 debug!("vsock: RX queue event");
@@ -532,6 +563,8 @@ where
         }
         let mut handler = VsockEpollHandler {
             reset_pending: self.reset_pending,
+            reset_ack_avail: None,
+            backend_registered: false,
             mem,
             queues: virtqueues,
             queue_evts,
@@ -878,6 +911,28 @@ mod tests {
                 .handle_event(&mut epoll_helper, &event)
                 .expect_err("handle_event() should have failed");
         }
+    }
+
+    #[test]
+    fn test_backend_waits_until_guest_consumes_transport_reset() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_epoll_handler_context();
+        ctx.handler.reset_pending = true;
+        ctx.guest_evvq.dtable[0].set(0x0060_0000, 4, 2, 0);
+        ctx.guest_evvq.avail.ring[0].set(0);
+        ctx.guest_evvq.avail.idx.set(1);
+        let mut helper = EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, BACKEND_EVENT as u64);
+        ctx.handler.handle_event(&mut helper, &event).unwrap();
+        // Publishing the RESET interrupt is not guest acknowledgement. In this
+        // interleaving the guest has not run the reset worker yet.
+        assert!(ctx.handler.backend.read().unwrap().evset.is_none(),
+            "backend accepted a new connection before the guest reset completed");
+        // Linux posts the consumed event buffer only after aborting old sockets.
+        ctx.guest_evvq.avail.ring[1].set(0);
+        ctx.guest_evvq.avail.idx.set(2);
+        ctx.handler.handle_event(&mut helper, &event).unwrap();
+        assert!(ctx.handler.backend.read().unwrap().evset.is_some());
     }
 
     #[test]
