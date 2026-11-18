@@ -100,6 +100,7 @@ pub mod memory_manager;
 pub mod migration;
 mod pci_segment;
 mod prefault;
+mod prepared_identity;
 pub mod seccomp_filters;
 mod serial_manager;
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
@@ -765,6 +766,7 @@ impl VmOwnership {
 }
 
 struct PreparedRestoreVm {
+    identity: Box<VmConfig>,
     profile: hypervisor::HypervisorVmConfig,
     cpus: serde_json::Value,
     vm: Arc<dyn hypervisor::Vm>,
@@ -2172,13 +2174,17 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        prepared_identity: bool,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
                 let _restore_trace = crate::fork::restore_trace(source_url);
-                let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+                let mut snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+                if prepared_identity {
+                    prepared_identity::apply_snapshot(&mut snapshot, &vm_config.lock().unwrap())?;
+                }
                 crate::fork::trace_point("snapshot_decoded");
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
@@ -2658,6 +2664,7 @@ impl RequestHandler for Vmm {
             self.prepared_restore_vm = Some(PreparedRestoreVm {
                 profile,
                 cpus: serde_json::to_value(&config.cpus).unwrap(),
+                identity: config,
                 vm,
             });
             return Ok(());
@@ -2865,6 +2872,24 @@ impl RequestHandler for Vmm {
                 let vm_config = Arc::new(Mutex::new(
                     recv_vm_config(source_url).map_err(VmError::Restore)?,
                 ));
+                if restore_cfg.prepared_identity {
+                    if !self.fork_enabled
+                        || restore_cfg.memory_restore_mode != MemoryRestoreMode::CopyOnWrite
+                        || restore_cfg.prefault
+                    {
+                        return Err(VmError::ForkUnsupported(
+                            "Prepared identity requires fork-enabled CoW restore without prefault"
+                                .into(),
+                        ));
+                    }
+                    let slot = self.prepared_restore_vm.as_ref().ok_or_else(|| {
+                        VmError::ForkUnsupported("No prepared slot identity".into())
+                    })?;
+                    prepared_identity::apply_config(
+                        &mut vm_config.lock().unwrap(),
+                        &slot.identity,
+                    )?;
+                }
                 restore_cfg
                     .validate(&vm_config.lock().unwrap().clone())
                     .map_err(VmError::ConfigValidation)?;
@@ -2921,6 +2946,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    restore_cfg.prepared_identity,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -3102,7 +3128,13 @@ impl RequestHandler for Vmm {
             build_version,
             version,
             pid: process::id() as i64,
-            features: feature_list(),
+            features: {
+                let mut features = feature_list();
+                if self.fork_enabled {
+                    features.push("prepared_identity_v1".into());
+                }
+                features
+            },
         }
     }
 

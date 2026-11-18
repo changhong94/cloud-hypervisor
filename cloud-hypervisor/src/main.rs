@@ -141,6 +141,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[derive(Error, Debug)]
 enum Error {
+    #[error("Prepared startup failed: {0}")]
+    PrepareStartup(String),
     #[error("Failed to prepare fork child")]
     ForkChild(#[source] io::Error),
     #[error("Failed to create API EventFd")]
@@ -317,6 +319,10 @@ fn get_cli_options_sorted(
             .num_args(1..)
             .action(ArgAction::Append)
             .group("vm-config"),
+        Arg::new("enable-fork")
+            .long("enable-fork")
+            .action(ArgAction::SetTrue)
+            .help("Enable experimental same-host VM fork and its supervisor seccomp policy"),
         Arg::new("event-monitor")
             .long("event-monitor")
             .help("Path to report events on: path=<path> or fd=<fd>")
@@ -474,6 +480,19 @@ fn get_cli_options_sorted(
             .num_args(1..)
             .action(ArgAction::Append)
             .group("vm-config"),
+        Arg::new("prepare-config")
+            .long("prepare-config")
+            .help("Prepare an empty KVM/vCPU slot from a durable VM config JSON")
+            .num_args(1)
+            .requires("enable-fork")
+            .conflicts_with_all(["restore", "kernel", "firmware"])
+            .group("vmm-config"),
+        Arg::new("prepare-ready-fd")
+            .long("prepare-ready-fd")
+            .help("Inherited socket FD: write byte 1 only after empty-slot preparation succeeds")
+            .value_parser(clap::value_parser!(i32).range(3..))
+            .requires("prepare-config")
+            .group("vmm-config"),
         #[cfg(feature = "pvmemcontrol")]
         Arg::new("pvmemcontrol")
             .long("pvmemcontrol")
@@ -509,10 +528,6 @@ fn get_cli_options_sorted(
             .num_args(0..=1)
             .default_missing_value("")
             .group("vm-config"),
-        Arg::new("enable-fork")
-            .long("enable-fork")
-            .action(ArgAction::SetTrue)
-            .help("Enable experimental same-host VM fork and its supervisor seccomp policy"),
         Arg::new("seccomp")
             .long("seccomp")
             .num_args(1)
@@ -936,7 +951,30 @@ fn start_vmm(
             if !initial_start {
                 return Ok(());
             }
-            if payload_present {
+            if let Some(path) = cmd_arguments.get_one::<String>("prepare-config") {
+                use std::io::Write;
+                // Own and close the one-shot notification descriptor on both
+                // success and failure; it must never survive into a later fork.
+                let mut ready = cmd_arguments
+                    .get_one::<i32>("prepare-ready-fd")
+                    // SAFETY: The launcher transfers exclusive ownership of this
+                    // inherited descriptor through --prepare-ready-fd.
+                    .map(|fd| unsafe { File::from_raw_fd(*fd) });
+                let file = File::open(path).map_err(|e| Error::PrepareStartup(e.to_string()))?;
+                let config: VmConfig = serde_json::from_reader(file)
+                    .map_err(|e| Error::PrepareStartup(e.to_string()))?;
+                api::VmmPrepare
+                    .send(
+                        api_evt.try_clone().unwrap(),
+                        api_request_sender.clone(),
+                        Box::new(config),
+                    )
+                    .map_err(|e| Error::PrepareStartup(e.to_string()))?;
+                if let Some(file) = ready.as_mut() {
+                    file.write_all(&[1])
+                        .map_err(|e| Error::PrepareStartup(e.to_string()))?;
+                }
+            } else if payload_present {
                 let vm_params = VmParams::from_arg_matches(cmd_arguments);
                 let vm_config = VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
 
@@ -2290,6 +2328,48 @@ mod tests {
         .for_each(|(cli, openapi, equal)| {
             compare_vm_config_cli_vs_json(cli, openapi, *equal);
         });
+    }
+
+    #[test]
+    fn test_prepared_startup_cli_contract() {
+        let parse = |args: Vec<&str>| {
+            let (cpus, memory, rng) = prepare_default_values();
+            create_app(cpus, memory, rng).try_get_matches_from(args)
+        };
+        assert!(
+            parse(vec![
+                "cloud-hypervisor",
+                "--enable-fork",
+                "--prepare-config",
+                "slot.json",
+                "--prepare-ready-fd",
+                "3"
+            ])
+            .is_ok()
+        );
+        assert!(parse(vec!["cloud-hypervisor", "--prepare-ready-fd", "3"]).is_err());
+        assert!(
+            parse(vec![
+                "cloud-hypervisor",
+                "--enable-fork",
+                "--prepare-config",
+                "slot.json",
+                "--prepare-ready-fd",
+                "1"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(vec![
+                "cloud-hypervisor",
+                "--enable-fork",
+                "--prepare-config",
+                "slot.json",
+                "--kernel",
+                "vmlinuz"
+            ])
+            .is_err()
+        );
     }
 
     // TODO the check for the option list being sorted could be moved into the

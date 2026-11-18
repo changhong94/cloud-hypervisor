@@ -2991,6 +2991,9 @@ where
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoreConfig {
+    /// JSON API only: use transport identity from an already prepared KVM slot.
+    #[serde(default)]
+    pub prepared_identity: bool,
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
@@ -3099,6 +3102,7 @@ impl RestoreConfig {
             });
 
         Ok(RestoreConfig {
+            prepared_identity: false,
             source_url,
             prefault,
             memory_restore_mode,
@@ -5510,6 +5514,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot")?,
             RestoreConfig {
+                prepared_identity: false,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5525,6 +5530,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[3,4],net1@[5,6,7,8]]"
             )?,
             RestoreConfig {
+                prepared_identity: false,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5549,6 +5555,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
             RestoreConfig {
+                prepared_identity: false,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
@@ -5562,6 +5569,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]")?,
             RestoreConfig {
+                prepared_identity: false,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5580,6 +5588,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,vfio_fds=[vfio0@5,vfio1@6],iommufd_fd=7"
             )?,
             RestoreConfig {
+                prepared_identity: false,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5604,6 +5613,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,vfio_fds=[vfio0@5,vfio1@6],iommufd_fd=7"
             )?,
             RestoreConfig {
+                prepared_identity: false,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5769,6 +5779,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
 
         let valid_config = RestoreConfig {
+            prepared_identity: false,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5848,6 +5859,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         let another_valid_config = RestoreConfig {
+            prepared_identity: false,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5868,6 +5880,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         another_valid_config.validate(&snapshot_vm_config).unwrap();
 
         let invalid_restore_mode = RestoreConfig {
+            prepared_identity: false,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
@@ -5911,6 +5924,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         let invalid_cow_prefault = RestoreConfig {
+            prepared_identity: false,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::CopyOnWrite,
@@ -5983,6 +5997,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
 
         let valid_config = RestoreConfig {
+            prepared_identity: false,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5998,6 +6013,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let missing_iommufd = RestoreConfig {
+            prepared_identity: false,
             iommufd_fd: None,
             ..valid_config.clone()
         };
@@ -6007,6 +6023,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         let unknown_id = RestoreConfig {
+            prepared_identity: false,
             vfio_fds: Some(vec![RestoredVfioConfig {
                 id: "missing".to_string(),
                 fd: Some(5),
@@ -6019,6 +6036,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         let duplicate_id = RestoreConfig {
+            prepared_identity: false,
             vfio_fds: Some(vec![
                 RestoredVfioConfig {
                     id: "vfio0".to_string(),
@@ -6040,6 +6058,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         snapshot_vm_config.devices.as_mut().unwrap()[0].path = None;
         snapshot_vm_config.devices.as_mut().unwrap()[0].fd = Some(-1);
         let no_substitution = RestoreConfig {
+            prepared_identity: false,
             vfio_fds: None,
             iommufd_fd: None,
             ..valid_config.clone()

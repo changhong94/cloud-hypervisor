@@ -1824,6 +1824,14 @@ components:
       properties:
         source_url:
           type: string
+        prepared_identity:
+          type: boolean
+          default: false
+          description: >-
+            Apply transport identity from an existing vmm.prepare slot to the
+            immutable template in memory. Requires fork mode, private CopyOnWrite
+            RAM without prefault, read-only disks and one matching NIC plus vsock.
+            The caller must persist the slot identity and template binding first.
         prefault:
           type: boolean
         memory_restore_mode:
