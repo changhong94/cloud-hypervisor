@@ -560,6 +560,11 @@ fn get_cli_options_sorted(
             .num_args(1..)
             .action(ArgAction::Append)
             .group("vm-config"),
+        Arg::new("compact-restored-disk")
+            .long("compact-restored-disk")
+            .num_args(1)
+            .conflicts_with("vm-config")
+            .help("Compact an owned offline QCOW2 restore leaf; do not start a VM"),
         Arg::new("version")
             .short('V')
             .long("version")
@@ -1064,6 +1069,16 @@ fn start_vmm(
                 .map_err(Error::ForkChild)?;
         }
         let child = outcome.as_ref().is_ok_and(|branch| branch.child);
+        if child && state.request.snapshot_directory.is_some() {
+            // Acknowledge the immutable CoW capture before any serialization.
+            // The parent can rebuild its host workers and resume independently.
+            if let Ok(branch) = outcome {
+                branch.report(&Ok(())).map_err(Error::ForkChild)?;
+            }
+            let result = state.save_frozen_snapshot();
+            // Never enter VM restoration or unwind inherited device ownership.
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
         state.update_operation(&operations, None);
         completion = Some(outcome);
         if child {
@@ -1202,6 +1217,14 @@ fn main() {
             println!("Enabled features: {:?}", vmm::feature_list());
         }
 
+        return;
+    }
+
+    if let Some(path) = cmd_arguments.get_one::<String>("compact-restored-disk") {
+        if let Err(error) = vmm::compact_restored_disk(Path::new(path)) {
+            eprintln!("Cannot compact restored disk: {error}");
+            process::exit(1);
+        }
         return;
     }
 

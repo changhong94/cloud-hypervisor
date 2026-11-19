@@ -10,7 +10,7 @@
 mod backing;
 mod common;
 mod compact;
-pub use compact::{MergeStats, merge_layers, merge_layers_cancellable};
+pub use compact::{MergeStats, merge_layers, merge_layers_cancellable, merge_layers_reflink};
 mod decoder;
 mod engine_sync;
 #[cfg(feature = "io_uring")]

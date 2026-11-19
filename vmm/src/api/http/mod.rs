@@ -31,9 +31,9 @@ use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCancelMigration, VmCounters,
-    VmDelete, VmFork, VmForkStatus, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot, VmmPrepare,
+    VmDelete, VmFork, VmForkPrepare, VmForkStatus, VmNmi, VmPause, VmPowerButton, VmPreflush,
+    VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPrepare,
 };
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
@@ -295,6 +295,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         Box::new(VmActionHandler::new(&VmPause)),
     );
     r.routes.insert(
+        endpoint!("/vm.preflush"),
+        Box::new(VmActionHandler::new(&VmPreflush)),
+    );
+    r.routes.insert(
         endpoint!("/vm.power-button"),
         Box::new(VmActionHandler::new(&VmPowerButton)),
     );
@@ -350,6 +354,7 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         endpoint!("/vm.fork-status"),
         Box::new(VmActionHandler::new(&VmForkStatus)),
     );
+    r.routes.insert(endpoint!("/vm.fork-prepare"), Box::new(VmActionHandler::new(&VmForkPrepare)));
     r.routes.insert(
         endpoint!("/vm.fork"),
         Box::new(VmActionHandler::new(&VmFork)),

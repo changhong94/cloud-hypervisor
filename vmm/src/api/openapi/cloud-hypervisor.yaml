@@ -126,6 +126,17 @@ paths:
         409:
           description: The operation conflicts with the current state of the VM.
 
+  /vm.preflush:
+    put:
+      summary: Preflush writable disks without pausing the VM.
+      description: Preparatory writeback only. Does not create a checkpoint or replace the final stopped-device durability barrier.
+      operationId: preflushVM
+      responses:
+        204:
+          description: Disk preflush completed; the VM running state is unchanged.
+        500:
+          description: The VM is unavailable or disk preflush failed.
+
   /vm.resume:
     put:
       summary: Resume a previously paused VM instance.
@@ -507,6 +518,22 @@ paths:
         "404":
           description: The new device could not be added to the VM instance.
       summary: Add a new userspace device to the VM
+
+  /vm.fork-prepare:
+    put:
+      summary: Prepare rollback-owned disk branches for offline live capture.
+      description: Keeps the source running. Only one preparation is retained per VM; replacement rolls it back. The subsequent fork must match the request and disk configuration. Final quiescence, source identity validation and durability barriers remain mandatory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmForkConfig"
+      responses:
+        200:
+          description: Prepared; the source is still running.
+        500:
+          description: Preparation failed without committing a disk branch.
 
   /vm.fork:
     put:
@@ -1777,6 +1804,9 @@ components:
         - child_api_socket
         - child_serial_socket
       properties:
+        snapshot_directory:
+          type: string
+          description: Empty private absolute directory for offline CoW capture, without starting a child VM.
         child_api_socket:
           type: string
           description: Absolute unused path for the child's HTTP API socket.

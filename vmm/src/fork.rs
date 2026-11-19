@@ -592,7 +592,59 @@ fn new_socket_path(path: &Path) -> Result<PathBuf, Error> {
     }
 }
 
+/// One uncommitted preparation per VM. Drop rolls back only owned names.
+pub(crate) struct PreparedSnapshotDisks {
+    request: Vec<u8>,
+    disks: Vec<u8>,
+    branch: Option<crate::fork_disk::PreparedBranch>,
+}
+
 impl Vmm {
+    pub(crate) fn prepare_snapshot_disks(&mut self, request: VmForkConfig) -> Result<(), Error> {
+        self.prepared_snapshot_disks.take();
+        if !self.fork_enabled || request.snapshot_directory.is_none() {
+            return Err(unsupported(
+                "Disk preparation requires enabled offline capture",
+            ));
+        }
+        if self
+            .fork_operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(ForkOperation::pending)
+        {
+            return Err(Error::ForkBusy);
+        }
+        if let Some(job) = self.disk_retirement.take() {
+            job.wait().map_err(|e| unsupported(&e.to_string()))?;
+        }
+        if let Some(job) = self.disk_merge.take() {
+            job.finish().map_err(|e| unsupported(&e.to_string()))?;
+        }
+        let vm = match &self.vm {
+            VmOwnership::Owned(vm) if vm.get_state() == VmState::Running => vm,
+            _ => return Err(Error::VmNotRunning),
+        };
+        let config = vm.get_config().lock().unwrap().clone();
+        validate_config(&config)?;
+        crate::fork_disk::ready_to_pause(&config).map_err(|e| unsupported(&e.to_string()))?;
+        static NEXT_PREPARATION: AtomicU64 = AtomicU64::new(1);
+        let operation = format!(
+            "prepared-{}-{}",
+            process::id(),
+            NEXT_PREPARATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let branch = crate::fork_disk::prepare(&config, &request, &operation)
+            .map_err(|e| unsupported(&e.to_string()))?;
+        self.prepared_snapshot_disks = Some(PreparedSnapshotDisks {
+            request: serde_json::to_vec(&request).unwrap(),
+            disks: serde_json::to_vec(&config.disks).unwrap(),
+            branch,
+        });
+        Ok(())
+    }
+
     pub(crate) fn prepare_fork(
         &mut self,
         mut request: VmForkConfig,
@@ -615,11 +667,14 @@ impl Vmm {
         {
             return Err(Error::ForkBusy);
         }
+        let prepared_snapshot = self.prepared_snapshot_disks.take();
+        let request_key = serde_json::to_vec(&request).unwrap();
         let vm = match &mut self.vm {
             VmOwnership::Owned(vm) => vm,
             VmOwnership::Migration { .. } => return Err(Error::VmMigrating),
             VmOwnership::None => return Err(Error::VmNotRunning),
         };
+        vm.finish_incremental_restore_for_fork()?;
         if vm.restoring() {
             return Err(Error::VmRestoring);
         }
@@ -628,7 +683,32 @@ impl Vmm {
         }
         let config = vm.get_config().lock().unwrap().clone();
         validate_config(&config)?;
-        crate::fork_disk::validate(&config, &request).map_err(|e| unsupported(&e.to_string()))?;
+        if let Some(prepared) = &prepared_snapshot {
+            if prepared.request != request_key
+                || prepared.disks != serde_json::to_vec(&config.disks).unwrap()
+            {
+                return Err(unsupported(
+                    "Prepared capture no longer matches request or disks",
+                ));
+            }
+            // PreparedBranch::commit rechecks active inode/path after quiescence.
+        } else {
+            crate::fork_disk::validate(&config, &request)
+                .map_err(|e| unsupported(&e.to_string()))?;
+        }
+        if let Some(directory) = &mut request.snapshot_directory {
+            let metadata = fs::symlink_metadata(&*directory)
+                .map_err(|e| unsupported(&format!("Capture directory: {e}")))?;
+            if !directory.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
+                || fs::read_dir(&*directory).map_err(|e| unsupported(&e.to_string()))?.next().is_some()
+            {
+                return Err(unsupported("Capture requires an empty absolute directory, without a symlink"));
+            }
+            *directory = directory.canonicalize().map_err(|e| unsupported(&e.to_string()))?;
+            if request.child_vsock.is_some() || request.child_net.is_some() {
+                return Err(unsupported("Offline capture must not request a running child identity"));
+            }
+        }
         request.child_api_socket = new_socket_path(&request.child_api_socket)?;
         request.child_serial_socket = new_socket_path(&request.child_serial_socket)?;
         let api_lock = PathBuf::from(format!("{}.lock", request.child_api_socket.display()));
@@ -641,78 +721,80 @@ impl Vmm {
                 "Child API and serial sockets and their lock files must differ",
             ));
         }
-        match (&config.vsock, &mut request.child_vsock) {
-            (Some(parent), Some(child)) => {
-                if child.cid <= 2 || child.cid == u32::MAX || child.cid == parent.cid {
+        if request.snapshot_directory.is_none() {
+            match (&config.vsock, &mut request.child_vsock) {
+                (Some(parent), Some(child)) => {
+                    if child.cid <= 2 || child.cid == u32::MAX || child.cid == parent.cid {
+                        return Err(unsupported(
+                            "Child vsock CID must be distinct and greater than 2",
+                        ));
+                    }
+                    child.socket = new_socket_path(&child.socket)?;
+                    let child_lock = PathBuf::from(format!("{}.lock", child.socket.display()));
+                    if child.socket == request.child_api_socket
+                        || child.socket == request.child_serial_socket
+                        || child.socket == api_lock
+                        || child.socket == serial_lock
+                        || child_lock == request.child_api_socket
+                        || child_lock == request.child_serial_socket
+                    {
+                        return Err(unsupported("Child vsock socket must be independent"));
+                    }
+                    // Only CID and backend path may change; preserve PCI topology.
+                    child.pci_common = parent.pci_common.clone();
+                }
+                (None, None) => {}
+                _ => {
                     return Err(unsupported(
-                        "Child vsock CID must be distinct and greater than 2",
+                        "A vsock source requires child_vsock CID and socket",
                     ));
                 }
-                child.socket = new_socket_path(&child.socket)?;
-                let child_lock = PathBuf::from(format!("{}.lock", child.socket.display()));
-                if child.socket == request.child_api_socket
-                    || child.socket == request.child_serial_socket
-                    || child.socket == api_lock
-                    || child.socket == serial_lock
-                    || child_lock == request.child_api_socket
-                    || child_lock == request.child_serial_socket
-                {
-                    return Err(unsupported("Child vsock socket must be independent"));
+            }
+            match (
+                config.net.as_ref(),
+                request.child_net.as_mut(),
+                request.child_netns.as_ref(),
+            ) {
+                (Some(parent), Some(child), Some(netns)) => {
+                    if child.mac.is_none()
+                        || child.mac == parent[0].mac
+                        || child.tap.is_none()
+                        || child.fds.is_some()
+                        || child.vhost_user
+                        || child.num_queues != parent[0].num_queues
+                        || !netns.is_absolute()
+                        || !netns.exists()
+                    {
+                        return Err(unsupported(
+                            "Child requires an independent named TAP, MAC and network namespace",
+                        ));
+                    }
+                    use std::os::unix::fs::MetadataExt;
+                    let target = fs::metadata(netns)
+                        .map_err(|_| unsupported("Invalid child network namespace"))?;
+                    let current = fs::metadata("/proc/self/ns/net")
+                        .map_err(|_| unsupported("Cannot inspect parent network namespace"))?;
+                    if target.ino() == current.ino() && target.dev() == current.dev() {
+                        return Err(unsupported(
+                            "Child network namespace must differ from parent",
+                        ));
+                    }
+                    // Preserve negotiated features and PCI/queue topology exactly.
+                    let tap = child.tap.clone();
+                    let mac = child.mac;
+                    *child = parent[0].clone();
+                    child.tap = tap;
+                    child.mac = mac;
+                    let mut checked = config.clone();
+                    checked.net = Some(vec![child.clone()]);
+                    validate_config(&checked)?;
                 }
-                // Only CID and backend path may change; preserve PCI topology.
-                child.pci_common = parent.pci_common.clone();
-            }
-            (None, None) => {}
-            _ => {
-                return Err(unsupported(
-                    "A vsock source requires child_vsock CID and socket",
-                ));
-            }
-        }
-        match (
-            config.net.as_ref(),
-            request.child_net.as_mut(),
-            request.child_netns.as_ref(),
-        ) {
-            (Some(parent), Some(child), Some(netns)) => {
-                if child.mac.is_none()
-                    || child.mac == parent[0].mac
-                    || child.tap.is_none()
-                    || child.fds.is_some()
-                    || child.vhost_user
-                    || child.num_queues != parent[0].num_queues
-                    || !netns.is_absolute()
-                    || !netns.exists()
-                {
+                (None, None, None) => {}
+                _ => {
                     return Err(unsupported(
-                        "Child requires an independent named TAP, MAC and network namespace",
+                        "Fork requires matching parent and child network topology",
                     ));
                 }
-                use std::os::unix::fs::MetadataExt;
-                let target = fs::metadata(netns)
-                    .map_err(|_| unsupported("Invalid child network namespace"))?;
-                let current = fs::metadata("/proc/self/ns/net")
-                    .map_err(|_| unsupported("Cannot inspect parent network namespace"))?;
-                if target.ino() == current.ino() && target.dev() == current.dev() {
-                    return Err(unsupported(
-                        "Child network namespace must differ from parent",
-                    ));
-                }
-                // Preserve negotiated features and PCI/queue topology exactly.
-                let tap = child.tap.clone();
-                let mac = child.mac;
-                *child = parent[0].clone();
-                child.tap = tap;
-                child.mac = mac;
-                let mut checked = config.clone();
-                checked.net = Some(vec![child.clone()]);
-                validate_config(&checked)?;
-            }
-            (None, None, None) => {}
-            _ => {
-                return Err(unsupported(
-                    "Fork requires matching parent and child network topology",
-                ));
             }
         }
         if let Some(job) = &self.disk_retirement {
@@ -724,6 +806,7 @@ impl Vmm {
         }
         crate::fork_disk::ready_to_pause(&config).map_err(|e| unsupported(&e.to_string()))?;
         static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+
         let operation_id = format!(
             "{}-{}",
             process::id(),
@@ -731,8 +814,12 @@ impl Vmm {
         );
         let preparation_started = Instant::now();
         let running = vm.get_state() == VmState::Running;
-        let prepared_disks = crate::fork_disk::prepare(&config, &request, &operation_id)
-            .map_err(|e| unsupported(&e.to_string()))?;
+        let prepared_disks = if let Some(prepared) = prepared_snapshot {
+            prepared.branch
+        } else {
+            crate::fork_disk::prepare(&config, &request, &operation_id)
+                .map_err(|e| unsupported(&e.to_string()))?
+        };
         fork_log!(
             "VM_FORK disk_prepare_before_pause_ms={:.3} guest_running={running}",
             preparation_started.elapsed().as_secs_f64() * 1000.0
@@ -821,10 +908,12 @@ impl Vmm {
         let retired_vm = if reuse {
             // This is a teardown commit after snapshot: a partial detach cannot
             // safely resume the old device graph. Fail closed on ioctl errors.
-            if let Err(error) = vm.detach_fork_events() {
+            trace_point("events_detach_begin");
+            if let Err(error) = vm.detach_fork_events(request.snapshot_directory.is_some()) {
                 fork_log!("FATAL: cannot detach old KVM events: {error}");
                 process::exit(1);
             }
+            trace_point("events_detach_done");
             None
         } else {
             Some(vm.retain_fork_vm())
@@ -995,6 +1084,15 @@ impl ForkState {
         Ok(())
     }
     pub fn parent_ready(&mut self) {
+        // All new disk backings are open now. Offline capture has no child VM
+        // to restore, so close the old owner while the API/agent resume proceeds.
+        // The controller still awaits this result before releasing guest tasks.
+        if self.request.snapshot_directory.is_some() {
+            if let Some(job) = &self.disk_retirement {
+                job.start();
+                self.mark("snapshot_disk_retirement_started");
+            }
+        }
         self.operation.parent_ready_ms = Some(self.started.elapsed().as_secs_f64() * 1000.0);
     }
     pub fn update_operation(
@@ -1141,6 +1239,9 @@ impl ForkState {
             }
             let mut ready = [0];
             b.read_exact(&mut ready)?;
+            if self.request.snapshot_directory.is_some() {
+                return Ok(ForkBranch { child: true, stream: b });
+            }
             self.config.serial.common.socket = Some(self.request.child_serial_socket.clone());
             self.config.vsock = self.request.child_vsock.clone();
             if let Some(net) = self.request.child_net.clone() {
@@ -1229,6 +1330,46 @@ impl ForkState {
                 stream: a,
             })
         }
+    }
+
+    /// Runs only in the single-threaded CoW capture child, without a KVM VM.
+    pub fn save_frozen_snapshot(&self) -> io::Result<()> {
+        let directory = self.request.snapshot_directory.as_ref()
+            .ok_or_else(|| io::Error::other("Missing capture directory"))?;
+        let result = (|| {
+            // Do not compete with parent runtime reconstruction for CPU and
+            // page faults. Reuse the durability channel, without a new thread
+            // or polling file. Parent loss/failure must not publish a snapshot.
+            let peer = self.retirement_peer.lock().unwrap().take()
+                .ok_or_else(|| io::Error::other("Missing capture retirement channel"))?;
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
+            let mut bytes = Vec::new();
+            peer.take(65536).read_to_end(&mut bytes)?;
+            let retired: Result<(), String> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            retired.map_err(io::Error::other)?;
+            self.mark("capture_disk_durable");
+            let memory = self.snapshot.snapshots.get("memory-manager")
+                .ok_or_else(|| io::Error::other("Missing memory snapshot"))?;
+            let full_memory = crate::memory_manager::save_frozen_memory(memory, &self.memory, directory)?;
+            let mut snapshot = self.snapshot.clone();
+            snapshot.snapshots.insert("memory-manager".into(), full_memory);
+            for (name, bytes) in [("config.json", serde_json::to_vec(&self.config)),
+                                  ("state.json", serde_json::to_vec(&snapshot))] {
+                let mut f = fs::OpenOptions::new().write(true).create_new(true).open(directory.join(name))?;
+                f.write_all(&bytes.map_err(io::Error::other)?)?;
+                f.sync_all()?;
+            }
+            Ok::<_, io::Error>(())
+        })();
+        let status = serde_json::to_vec(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()))
+            .map_err(io::Error::other)?;
+        let temporary = directory.join("capture-status.pending");
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        f.write_all(&status)?;
+        f.sync_all()?;
+        fs::rename(temporary, directory.join("capture-status.json"))?;
+        fs::File::open(directory)?.sync_all()?;
+        result
     }
 
     fn ram_pss(&self) -> io::Result<u64> {

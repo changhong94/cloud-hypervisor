@@ -130,6 +130,20 @@ fn open_raw(
     file: fs::File,
     options: &DiskOpenOptions<'_>,
 ) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
+    let probe = crate::AlignedFile::new(
+        file.try_clone()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?,
+        options.direct,
+    );
+    if crate::manifest::Descriptor::read(&probe)
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?
+        .is_some()
+    {
+        return Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            io::Error::other("Manifest bases require a QCOW2 wrapper"),
+        ));
+    }
     if !options.readonly && !options.sparse {
         preallocate_disk(&file, options.path);
     }

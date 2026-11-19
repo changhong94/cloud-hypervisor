@@ -58,7 +58,7 @@ use crate::coredump::{
 };
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
-use crate::sparse::{next_data_extent, write_region_sparse};
+use crate::sparse::{next_data_extent, write_memory_sparse, write_region_sparse};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdMemorySource, UffdRange,
 };
@@ -262,6 +262,7 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    incremental_memory: Option<IncrementalMemory>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -1084,10 +1085,38 @@ impl MemoryManager {
     ) -> Result<(), Error> {
         let mut file_offset: u64 = 0;
 
-        let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
-        let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(
-            snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
-        ));
+        let descriptor = file_path.with_extension("manifest.json");
+        self.incremental_memory = None;
+        let mut zero_ranges = Vec::new();
+        let (snapshot_file, source, shutdown_fd): (
+            Option<File>,
+            Box<dyn UffdMemorySource>,
+            Option<OwnedFd>,
+        ) = if descriptor.exists() {
+            let source = crate::uffd::ManifestUffdMemorySource::open(
+                &descriptor,
+                saved_regions.ranges().iter().map(|r| r.length).sum(),
+            )
+            .map_err(Error::SnapshotOpen)?;
+            let d: serde_json::Value =
+                serde_json::from_reader(File::open(&descriptor).map_err(Error::SnapshotOpen)?)
+                    .map_err(|e| Error::SnapshotOpen(io::Error::other(e)))?;
+            if d["incremental"].as_bool().unwrap_or(false) {
+                let base: MemoryBaseline = serde_json::from_value(d["baseline"].clone())
+                    .map_err(|e| Error::SnapshotOpen(io::Error::other(e)))?;
+                self.incremental_memory = Some(IncrementalMemory {
+                    base,
+                    dirty: Default::default(),
+                });
+            }
+            zero_ranges = source.zero_ranges.clone();
+            let fd = source.shutdown_fd().map_err(Error::SnapshotOpen)?;
+            (None, Box::new(source), Some(fd))
+        } else {
+            let file = File::open(file_path).map_err(Error::SnapshotOpen)?;
+            let source = FileUffdMemorySource::new(file.try_clone().map_err(Error::SnapshotOpen)?);
+            (Some(file), Box::new(source), None)
+        };
 
         let Some(uffd) = self.prepare_uffd(
             saved_regions,
@@ -1116,25 +1145,48 @@ impl MemoryManager {
             .collect();
 
         // For sparse files, we mark holes as served pages so we don't prefault them.
-        for (range, served) in uffd.ranges().iter().zip(&served_bitmap) {
-            let end = range.source_offset + range.length;
-            let mut file_cursor = range.source_offset;
-            while let Ok(next) = next_data_extent(snapshot_file.as_fd(), file_cursor, end) {
-                let (data_off, ext_len) = next.unwrap_or((end, 0));
-                let hole_start =
-                    (file_cursor - range.source_offset).next_multiple_of(range.page_size);
-                let hole_end = align_down(data_off - range.source_offset, range.page_size);
-                if hole_end > hole_start {
-                    served.set_addr_range(hole_start as usize, (hole_end - hole_start) as usize);
+        if let Some(snapshot_file) = &snapshot_file {
+            for (range, served) in uffd.ranges().iter().zip(&served_bitmap) {
+                let end = range.source_offset + range.length;
+                let mut file_cursor = range.source_offset;
+                while let Ok(next) = next_data_extent(snapshot_file.as_fd(), file_cursor, end) {
+                    let (data_off, ext_len) = next.unwrap_or((end, 0));
+                    let hole_start =
+                        (file_cursor - range.source_offset).next_multiple_of(range.page_size);
+                    let hole_end = align_down(data_off - range.source_offset, range.page_size);
+                    if hole_end > hole_start {
+                        served
+                            .set_addr_range(hole_start as usize, (hole_end - hole_start) as usize);
+                    }
+                    if next.is_none() {
+                        break;
+                    }
+                    file_cursor = data_off + ext_len;
                 }
-                if next.is_none() {
-                    break;
-                }
-                file_cursor = data_off + ext_len;
             }
         }
-
-        self.spawn_uffd_handler(uffd, None, served_bitmap, source, exit_evt, true)?;
+        for (range, served) in uffd.ranges().iter().zip(&served_bitmap) {
+            for &(start, len) in &zero_ranges {
+                let lo = start.max(range.source_offset);
+                let hi = (start + len).min(range.source_offset + range.length);
+                if hi <= lo {
+                    continue;
+                }
+                let first = (lo - range.source_offset).next_multiple_of(range.page_size);
+                let end = align_down(hi - range.source_offset, range.page_size);
+                if end > first {
+                    served.set_addr_range(first as usize, (end - first) as usize);
+                }
+            }
+        }
+        self.spawn_uffd_handler(
+            uffd,
+            shutdown_fd,
+            served_bitmap,
+            source,
+            exit_evt,
+            self.incremental_memory.is_none(),
+        )?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -1389,6 +1441,101 @@ impl MemoryManager {
                 _ => {}
             }
         }
+    }
+
+    pub fn incremental_memory(&self) -> bool {
+        self.incremental_memory.is_some()
+    }
+
+    pub fn accumulate_snapshot_dirty(&mut self, ranges: &MemoryRangeTable) {
+        if let Some(state) = &mut self.incremental_memory {
+            for range in ranges.ranges() {
+                for gpa in (range.gpa..range.gpa + range.length).step_by(4096) {
+                    state.dirty.insert(gpa);
+                }
+            }
+        }
+    }
+
+    // Start KVM logging without clearing device writes made during restore.
+    pub fn enable_snapshot_dirty(&self) -> io::Result<()> {
+        self.vm.start_dirty_log().map_err(io::Error::other)
+    }
+
+    // Host fork requires no outstanding UFFD owner. Populate before its existing
+    // quiescence barrier; snapshots themselves do not take this path.
+    pub fn finish_incremental_restore_for_fork(&mut self) -> io::Result<()> {
+        if self.incremental_memory.is_none() {
+            return Ok(());
+        }
+        if self.restoring() {
+            let memory = self.guest_memory.memory();
+            let mut page = vec![0; 4096];
+            for r in &self.guest_ram_mappings {
+                for off in (0..r.size).step_by(4096) {
+                    memory
+                        .read_slice(&mut page, GuestAddress(r.gpa + off))
+                        .map_err(io::Error::other)?;
+                }
+            }
+            self.stop_uffd_handler();
+        }
+        Ok(())
+    }
+
+    fn send_memory_delta(&self, directory: &Path, state: &IncrementalMemory) -> io::Result<()> {
+        let total: u64 = self
+            .snapshot_memory_ranges
+            .ranges()
+            .iter()
+            .map(|r| r.length)
+            .sum();
+        if state.base.logical_bytes != total {
+            return Err(io::Error::other("Incremental RAM layout changed"));
+        }
+        let file = File::create(directory.join("memory-ranges.delta"))?;
+        file.set_len(total)?;
+        let memory = self.guest_memory.memory();
+        let mut cursor = 0;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut written = 0;
+        for r in self.snapshot_memory_ranges.ranges() {
+            let pages: Vec<_> = state
+                .dirty
+                .range(r.gpa..r.gpa + r.length)
+                .copied()
+                .collect();
+            let mut i = 0;
+            while i < pages.len() {
+                let start = pages[i];
+                let mut end = start + 4096;
+                i += 1;
+                while i < pages.len() && pages[i] == end {
+                    end += 4096;
+                    i += 1;
+                }
+                let offset = cursor + start - r.gpa;
+                let length = end - start;
+                written += write_memory_sparse(&file, offset, length, |off, bytes| {
+                    memory
+                        .read_slice(bytes, GuestAddress(start + off))
+                        .map_err(io::Error::other)
+                })?;
+                ranges.push((offset, length));
+            }
+            cursor += r.length;
+        }
+        let read_bytes: u64 = ranges.iter().map(|r| r.1).sum();
+        let metadata = serde_json::json!({"version":1,"size":total,"base":state.base,"ranges":ranges,
+            "read_bytes":read_bytes,"written_bytes":written});
+        serde_json::to_writer(
+            File::create(directory.join("memory-delta.json"))?,
+            &metadata,
+        )?;
+        info!(
+            "SNAPSHOT_MEMORY_DELTA logical_bytes={total} read_bytes={read_bytes} written_bytes={written}"
+        );
+        Ok(())
     }
 
     /// True while an on-demand (UFFD) restore is still faulting in guest RAM.
@@ -2330,6 +2477,7 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            incremental_memory: restore_data.and_then(|d| d.incremental_memory.clone()),
             memory_zones,
             guest_ram_mappings: Vec::new(),
             retained_ram_slots: None,
@@ -2394,6 +2542,9 @@ impl MemoryManager {
                 }
             }
 
+            if memory_restore_mode != MemoryRestoreMode::OnDemand {
+                mm.lock().unwrap().incremental_memory = None;
+            }
             Ok(mm)
         } else {
             Err(Error::RestoreMissingSourceUrl)
@@ -3225,6 +3376,7 @@ impl MemoryManager {
 
     pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
         MemoryManagerSnapshotData {
+            incremental_memory: self.incremental_memory.clone(),
             memory_ranges: self.snapshot_memory_ranges.clone(),
             guest_ram_mappings: self.guest_ram_mappings.clone(),
             start_of_device_area: self.start_of_device_area.0,
@@ -3718,7 +3870,22 @@ impl Drop for MemoryManager {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct MemoryBaseline {
+    manifest: String,
+    kind: String,
+    logical_bytes: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct IncrementalMemory {
+    base: MemoryBaseline,
+    dirty: std::collections::BTreeSet<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryManagerSnapshotData {
+    #[serde(default)]
+    incremental_memory: Option<IncrementalMemory>,
     memory_ranges: MemoryRangeTable,
     guest_ram_mappings: Vec<GuestRamMapping>,
     start_of_device_area: u64,
@@ -3776,6 +3943,15 @@ impl Transportable for MemoryManager {
             .with_context(|| format!("Error creating memory snapshot file {memory_file_path:?}"))
             .map_err(MigratableError::MigrateSend)?;
 
+        if let Some(incremental) = &self.incremental_memory {
+            let directory = memory_file_path.parent().unwrap();
+            if directory.join("allow-memory-delta").is_file() {
+                return self
+                    .send_memory_delta(directory, incremental)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()));
+            }
+        }
+
         let total_len: u64 = self
             .snapshot_memory_ranges
             .ranges()
@@ -3819,11 +3995,33 @@ impl Transportable for MemoryManager {
                 .map_err(MigratableError::MigrateSend)?;
             }
 
+            if sparse_layout && !wrote_sparse {
+                let started = time::Instant::now();
+                let written = write_memory_sparse(
+                    &memory_file,
+                    file_cursor,
+                    range.length,
+                    |offset, bytes| {
+                        guest_memory
+                            .read_slice(bytes, GuestAddress(range.gpa + offset))
+                            .map_err(io::Error::other)
+                    },
+                )
+                .context("Error writing private sparse memory snapshot")
+                .map_err(MigratableError::MigrateSend)?;
+                info!(
+                    "SNAPSHOT_MEMORY logical_bytes={} written_bytes={} elapsed_us={}",
+                    range.length,
+                    written,
+                    started.elapsed().as_micros()
+                );
+                wrote_sparse = true;
+            }
+
             if !wrote_sparse {
-                // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE). Match the dense layout by seeking to
-                // file_cursor and streaming bytes via the existing
-                // volatile copy.
+                // Dense fallback when the destination cannot be pre-sized.
+                // Match the dense layout by seeking to file_cursor and
+                // streaming bytes via the existing volatile copy.
                 memory_file
                     .seek(SeekFrom::Start(file_cursor))
                     .context("Error seeking memory snapshot file")
@@ -3866,14 +4064,20 @@ impl Migratable for MemoryManager {
             .context("Error starting VM dirty log")
             .map_err(MigratableError::MigrateSend)?;
 
-        for r in self.guest_memory.memory().iter() {
-            (**r).bitmap().reset();
+        if self.incremental_memory.is_none() {
+            for r in self.guest_memory.memory().iter() {
+                (**r).bitmap().reset();
+            }
         }
 
         Ok(())
     }
 
     fn stop_dirty_log(&mut self) -> result::Result<(), MigratableError> {
+        // A checkpoint lineage needs tracking for its entire lifetime.
+        if self.incremental_memory.is_some() {
+            return Ok(());
+        }
         self.vm
             .stop_dirty_log()
             .context("Error stopping VM dirty log")
@@ -3916,6 +4120,14 @@ impl Migratable for MemoryManager {
             let ranges_before = table.ranges().len();
             table.extend_from_dirty_bitmap(dirty_bitmap, r.gpa, page_size);
             let slot_ranges = &table.ranges()[ranges_before..];
+            // Retain consumed bits even if a subsequent slot query fails.
+            if let Some(state) = self.incremental_memory.as_mut() {
+                for range in slot_ranges {
+                    state
+                        .dirty
+                        .extend((range.gpa..range.gpa + range.length).step_by(4096));
+                }
+            }
 
             trace!(
                 "Dirty memory range table for slot {}: ranges = {} size = {} KiB",
@@ -4411,5 +4623,101 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+}
+
+/// Serialize the frozen child address space; no VM or mutable device is used.
+pub(crate) fn save_frozen_memory(
+    snapshot: &Snapshot,
+    memory: &GuestMemoryMmap,
+    directory: &std::path::Path,
+) -> io::Result<Snapshot> {
+    let mut data: MemoryManagerSnapshotData = snapshot.to_state().map_err(io::Error::other)?;
+    // prepare_fork completed any UFFD faults before the address space split.
+    // The capture is a new full payload, independent of the source's delta graph.
+    data.incremental_memory = None;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(directory.join(SNAPSHOT_FILENAME))?;
+    f.set_len(data.memory_ranges.ranges().iter().map(|r| r.length).sum())?;
+    let mut cursor = 0;
+    for range in data.memory_ranges.ranges() {
+        write_memory_sparse(&f, cursor, range.length, |offset, bytes| {
+            memory
+                .read_slice(bytes, GuestAddress(range.gpa + offset))
+                .map_err(io::Error::other)
+        })?;
+        cursor += range.length;
+    }
+    f.sync_all()?;
+    Snapshot::new_from_state(&data).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod frozen_capture_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_capture_preserves_sparse_ranges_and_refuses_overwrite() {
+        let memory =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8192), (GuestAddress(0x10000), 4096)])
+                .unwrap();
+        memory.write_slice(&[0x53; 4096], GuestAddress(0)).unwrap();
+        memory
+            .write_slice(&[0x9a; 4096], GuestAddress(0x10000))
+            .unwrap();
+        let mut ranges = MemoryRangeTable::default();
+        ranges.push(MemoryRange {
+            gpa: 0,
+            length: 8192,
+        });
+        ranges.push(MemoryRange {
+            gpa: 0x10000,
+            length: 4096,
+        });
+        let data = MemoryManagerSnapshotData {
+            incremental_memory: Some(IncrementalMemory {
+                base: MemoryBaseline {
+                    manifest: "source-only".into(),
+                    kind: "manifest-memory-graph".into(),
+                    logical_bytes: 12288,
+                },
+                dirty: std::collections::BTreeSet::from([0]),
+            }),
+            memory_ranges: ranges,
+            guest_ram_mappings: vec![],
+            start_of_device_area: 0,
+            boot_ram: 12288,
+            current_ram: 12288,
+            arch_mem_regions: vec![],
+            hotplug_slots: vec![],
+            next_memory_slot: 0,
+            selected_slot: 0,
+            next_hotplug_slot: 0,
+        };
+        let snapshot = Snapshot::new_from_state(&data).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let saved = save_frozen_memory(&snapshot, &memory, directory.path()).unwrap();
+        let restored: MemoryManagerSnapshotData = saved.to_state().unwrap();
+        assert!(restored.incremental_memory.is_none());
+        assert!(
+            snapshot
+                .to_state::<MemoryManagerSnapshotData>()
+                .unwrap()
+                .incremental_memory
+                .is_some()
+        );
+        let bytes = std::fs::read(directory.path().join(SNAPSHOT_FILENAME)).unwrap();
+        assert_eq!(bytes.len(), 12288);
+        assert_eq!(&bytes[..4096], &[0x53; 4096]);
+        assert_eq!(&bytes[4096..8192], &[0; 4096]);
+        assert_eq!(&bytes[8192..], &[0x9a; 4096]);
+        assert!(save_frozen_memory(&snapshot, &memory, directory.path()).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join(SNAPSHOT_FILENAME)).unwrap(),
+            bytes
+        );
     }
 }

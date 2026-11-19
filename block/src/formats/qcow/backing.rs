@@ -21,6 +21,7 @@ use crate::formats::qcow::common::decompress_cluster;
 struct RawBacking {
     pub(crate) file: AlignedFile,
     pub(crate) virtual_size: u64,
+    manifest: Option<crate::manifest::Reader>,
 }
 
 // SAFETY: The only I/O operation is read_at which is position independent
@@ -35,9 +36,17 @@ impl BackingRead for RawBacking {
         }
         let available = (self.virtual_size - address) as usize;
         if available >= buf.len() {
-            self.file.read_exact_at(buf, address)
+            if let Some(reader) = &self.manifest {
+                reader.read_at(address, buf)
+            } else {
+                self.file.read_exact_at(buf, address)
+            }
         } else {
-            self.file.read_exact_at(&mut buf[..available], address)?;
+            if let Some(reader) = &self.manifest {
+                reader.read_at(address, &mut buf[..available])?;
+            } else {
+                self.file.read_exact_at(&mut buf[..available], address)?;
+            }
             buf[available..].fill(0);
             Ok(())
         }
@@ -144,7 +153,16 @@ pub(super) fn shared_backing_from(bf: BackingFile) -> BlockResult<Arc<dyn Backin
 
     match kind {
         BackingKind::Inherited { reader, .. } => Ok(reader),
-        BackingKind::Raw(file) => Ok(Arc::new(RawBacking { file, virtual_size })),
+        BackingKind::Raw(file) => {
+            let manifest = crate::manifest::Descriptor::read(&file)
+                .and_then(|d| d.map(crate::manifest::Reader::new).transpose())
+                .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+            Ok(Arc::new(RawBacking {
+                file,
+                virtual_size,
+                manifest,
+            }))
+        }
         BackingKind::Qcow { inner, backing } => {
             let data_file =
                 inner.raw_file.file().try_clone().map_err(|e| {

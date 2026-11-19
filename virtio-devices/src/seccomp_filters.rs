@@ -112,6 +112,25 @@ fn virtio_balloon_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 
 fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     vec![
+        // Manifest bases use only a private Unix read service. Reconnect after
+        // host fork rather than sharing the parent's framed byte stream.
+        (libc::SYS_socket, create_socket_seccomp_rule()),
+        (libc::SYS_connect, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (
+            libc::SYS_setsockopt,
+            or![
+                and![
+                    Cond::new(1, ArgLen::Dword, Eq, libc::SOL_SOCKET as u64).unwrap(),
+                    Cond::new(2, ArgLen::Dword, Eq, libc::SO_RCVTIMEO as u64).unwrap()
+                ],
+                and![
+                    Cond::new(1, ArgLen::Dword, Eq, libc::SOL_SOCKET as u64).unwrap(),
+                    Cond::new(2, ArgLen::Dword, Eq, libc::SO_SNDTIMEO as u64).unwrap()
+                ],
+            ],
+        ),
         (libc::SYS_fallocate, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_fdatasync, vec![]),

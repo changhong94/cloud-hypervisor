@@ -88,6 +88,7 @@ pub mod device_manager;
 pub mod device_tree;
 pub mod fork;
 mod fork_disk;
+pub use fork_disk::compact_restored_disk;
 mod fork_retirement;
 #[cfg(feature = "guest_debug")]
 mod gdb;
@@ -791,6 +792,7 @@ pub struct Vmm {
     fork_pause_started: Option<std::time::Instant>,
     disk_merge: Option<Arc<fork_disk::MergeJob>>,
     disk_retirement: Option<Arc<fork_retirement::DiskRetirementJob>>,
+    prepared_snapshot_disks: Option<fork::PreparedSnapshotDisks>,
     vm_config: Option<Arc<Mutex<VmConfig>>>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
@@ -1036,6 +1038,7 @@ impl Vmm {
             fork_pause_started: None,
             disk_merge: None,
             disk_retirement: None,
+            prepared_snapshot_disks: None,
             vm_config: None,
             seccomp_action,
             hypervisor,
@@ -2615,6 +2618,10 @@ impl RequestHandler for Vmm {
         fork::operations_snapshot(&self.fork_operations)
     }
 
+    fn vm_fork_prepare(&mut self, request: api::VmForkConfig) -> result::Result<(), VmError> {
+        self.prepare_snapshot_disks(request)
+    }
+
     fn vm_fork(
         &mut self,
         request: api::VmForkConfig,
@@ -2808,6 +2815,13 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_preflush(&mut self) -> std::io::Result<()> {
+        match &self.vm {
+            VmOwnership::Owned(vm) => vm.preflush_fork_disks(),
+            _ => Err(std::io::Error::other("VM is not available for disk preflush")),
+        }
+    }
+
     fn vm_pause(&mut self) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm.pause().map_err(VmError::Pause),
@@ -2857,7 +2871,7 @@ impl RequestHandler for Vmm {
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
-                if vm.restoring() {
+                if vm.restoring() && !vm.incremental_memory() {
                     return Err(VmError::VmRestoring);
                 }
                 // Drain console_info so that FDs are not reused
@@ -3224,6 +3238,9 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_resize_disk(&mut self, id: String, desired_size: u64) -> result::Result<(), VmError> {
+        // Capacity is runtime state, not part of DiskConfig. Never reuse empty
+        // leaves sized before a resize request (including a failed resize).
+        self.prepared_snapshot_disks.take();
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
         match self.vm {
@@ -4021,6 +4038,7 @@ mod tests {
         let mut vmm = create_dummy_vmm();
 
         assert!(matches!(vmm.vm_pause(), Err(VmError::VmNotCreated)));
+        assert!(vmm.vm_preflush().is_err());
         assert!(matches!(vmm.vm_resume(), Err(VmError::VmNotCreated)));
         assert!(matches!(vmm.vm_power_button(), Err(VmError::VmNotCreated)));
         assert!(matches!(vmm.vm_shutdown(), Err(VmError::VmNotCreated)));

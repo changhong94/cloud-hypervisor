@@ -2779,7 +2779,50 @@ impl DeviceManager {
 
     /// A retained KVM must not keep the old transport event registrations.
     /// Only validated local virtio devices are supported by the fork profile.
-    pub(crate) fn detach_fork_events(&self) -> std::io::Result<()> {
+    pub(crate) fn detach_fork_events(&self, parallel: bool) -> std::io::Result<()> {
+        if parallel {
+            // Each transport owns its event registrations. All devices and
+            // vCPUs are paused; join every deassignment before host fork.
+            let mut devices = Vec::new();
+            for node in self.device_tree.lock().unwrap().pci_devices() {
+                if let Some(PciDeviceHandle::Virtio(device)) = &node.pci_device_handle {
+                    let base = node.resources.iter().find_map(|resource| match resource {
+                        Resource::PciBar { index, base, .. } if *index == VIRTIO_CONFIG_BAR_INDEX => Some(*base),
+                        _ => None,
+                    }).ok_or_else(|| std::io::Error::other("Missing fork PCI BAR"))?;
+                    devices.push((Arc::clone(device), base));
+                }
+            }
+            return std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for (device, base) in devices {
+                    let vm = Arc::clone(&self.address_manager.vm);
+                    workers.push(std::thread::Builder::new().name("fork-detach".into())
+                        .spawn_scoped(scope, move || -> std::io::Result<()> {
+                            let device = device.lock().unwrap();
+                            for (event, address) in device.ioeventfds(base) {
+                                vm.unregister_ioevent(event, &IoEventAddress::Mmio(address))
+                                    .map_err(std::io::Error::other)?;
+                            }
+                            device.detach_fork_irqfds()
+                        })?);
+                }
+                // IOAPIC routes are independent of the PCI MSI-X groups.
+                #[cfg(target_arch = "x86_64")]
+                let ioapic_result = self.interrupt_controller.as_ref()
+                    .map(|controller| controller.lock().unwrap().detach_fork_irqfds())
+                    .unwrap_or(Ok(()));
+                #[cfg(not(target_arch = "x86_64"))]
+                let ioapic_result: std::io::Result<()> = Ok(());
+                let mut result = ioapic_result;
+                for worker in workers {
+                    let joined = worker.join().map_err(|_| std::io::Error::other("fork event worker panicked"))
+                        .and_then(|r| r);
+                    if result.is_ok() { result = joined; }
+                }
+                result
+            });
+        }
         for node in self.device_tree.lock().unwrap().pci_devices() {
             if let Some(PciDeviceHandle::Virtio(device)) = &node.pci_device_handle {
                 let device = device.lock().unwrap();

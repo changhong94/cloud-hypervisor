@@ -988,3 +988,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
+
+/// Host-side Manifest disk descriptors.
+pub mod manifest;

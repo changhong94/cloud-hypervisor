@@ -51,10 +51,10 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmFork, VmForkStatus, VmNmi, VmPause,
-    VmPowerButton, VmReboot, VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize,
-    VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
-    VmmPrepare,
+    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmFork, VmForkPrepare, VmForkStatus, VmNmi,
+    VmPause, VmPowerButton, VmPreflush, VmReboot, VmReceiveMigration, VmReceiveMigrationData,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot, VmmPrepare,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -473,6 +473,7 @@ vm_action_put_handler!(VmDelete);
 vm_action_put_handler!(VmShutdown);
 vm_action_put_handler!(VmReboot);
 vm_action_put_handler!(VmPause);
+vm_action_put_handler!(VmPreflush);
 vm_action_put_handler!(VmResume);
 vm_action_put_handler!(VmPowerButton);
 vm_action_put_handler!(VmNmi);
@@ -490,6 +491,7 @@ vm_action_put_handler_body!(VmResizeDisk);
 vm_action_put_handler_body!(VmResizeZone);
 vm_action_put_handler_body!(VmSnapshot);
 vm_action_put_handler_body!(VmFork);
+vm_action_put_handler_body!(VmForkPrepare);
 vm_action_put_handler_body!(VmSendMigration);
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]

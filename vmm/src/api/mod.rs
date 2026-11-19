@@ -113,6 +113,9 @@ pub enum ApiError {
     #[error("The VM could not be paused")]
     VmPause(#[source] VmError),
 
+    #[error("The VM disk preflush failed")]
+    VmPreflush(#[source] std::io::Error),
+
     /// The VM could not resume.
     #[error("The VM could not resume")]
     VmResume(#[source] VmError),
@@ -893,6 +896,9 @@ pub trait RequestHandler {
     fn vm_fork_status(&mut self) -> Vec<ForkOperation> {
         Vec::new()
     }
+    fn vm_fork_prepare(&mut self, _config: VmForkConfig) -> Result<(), VmError> {
+        Err(VmError::VmNotRunning)
+    }
     fn vm_fork(&mut self, _config: VmForkConfig) -> Result<ForkOperation, VmError> {
         Err(VmError::ForkUnsupported(
             "Fork supervisor is unavailable".into(),
@@ -910,6 +916,7 @@ pub trait RequestHandler {
     fn vm_boot(&mut self) -> Result<(), VmError>;
 
     fn vm_pause(&mut self) -> Result<(), VmError>;
+    fn vm_preflush(&mut self) -> std::io::Result<()>;
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
@@ -1703,6 +1710,39 @@ impl ApiAction for VmPause {
     }
 }
 
+pub struct VmPreflush;
+
+impl ApiAction for VmPreflush {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmPreflush");
+
+            let response = vmm
+                .vm_preflush()
+                .map_err(ApiError::VmPreflush)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
 pub struct VmPowerButton;
 
 impl ApiAction for VmPowerButton {
@@ -2168,6 +2208,9 @@ impl ApiAction for VmShutdown {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmForkConfig {
+    /// Capture inherited state without constructing or running a child VM.
+    #[serde(default)]
+    pub snapshot_directory: Option<PathBuf>,
     #[serde(default)]
     pub parent_disk_dir: Option<PathBuf>,
     #[serde(default)]
@@ -2203,6 +2246,39 @@ impl ApiAction for VmFork {
                 warn!("VM fork response receiver disconnected");
             }
             Ok(accepted)
+        })
+    }
+
+    fn send(
+        &self,
+        evt: EventFd,
+        sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, evt, sender, data)
+    }
+}
+
+pub struct VmForkPrepare;
+
+impl ApiAction for VmForkPrepare {
+    type RequestBody = VmForkConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, config: Self::RequestBody, sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            let result = vmm.vm_fork_prepare(config).map_err(ApiError::VmFork);
+            if sender
+                .send(result.map(|operation| {
+                    ApiResponsePayload::VmAction(Some(serde_json::to_vec(&operation).unwrap()))
+                }))
+                .is_err()
+            {
+                // The guest is still running; preparation is bounded to one
+                // rollback-owned entry and is replaced by the next request.
+                warn!("VM fork preparation response receiver disconnected");
+            }
+            Ok(false)
         })
     }
 

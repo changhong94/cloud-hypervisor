@@ -378,6 +378,100 @@ impl UffdMemorySource for FileUffdMemorySource {
     }
 }
 
+/// Private endpoint prepared by the sandboxer outside VMM seccomp. Only the
+/// authenticated manifest selected by the host is accessible through it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestPageDescriptor {
+    socket: String,
+    logical_bytes: u64,
+    #[serde(default)]
+    incremental: bool,
+    #[serde(default)]
+    baseline: Option<serde_json::Value>,
+}
+pub(crate) struct ManifestUffdMemorySource {
+    pub(crate) zero_ranges: Vec<(u64, u64)>,
+    stream: std::os::unix::net::UnixStream,
+    buf: Vec<u8>,
+}
+impl ManifestUffdMemorySource {
+    pub(crate) fn open(path: &std::path::Path, expected_size: u64) -> io::Result<Self> {
+        let d: ManifestPageDescriptor = serde_json::from_reader(File::open(path)?)?;
+        if d.incremental && d.baseline.is_none() {
+            return Err(io::Error::other("Missing incremental memory baseline"));
+        }
+        if d.logical_bytes != expected_size {
+            return Err(io::Error::other("Manifest RAM size mismatch"));
+        }
+        let mut stream = std::os::unix::net::UnixStream::connect(d.socket)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(35)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(35)))?;
+        let mut size = [0; 8];
+        stream.read_exact(&mut size)?;
+        if u64::from_le_bytes(size) != expected_size {
+            return Err(io::Error::other("Manifest source length mismatch"));
+        }
+        stream.read_exact(&mut size)?;
+        let count = u64::from_le_bytes(size);
+        if count > 1 << 20 {
+            return Err(io::Error::other("Too many Manifest extents"));
+        }
+        let mut zero_ranges = Vec::new();
+        let mut previous_end = 0;
+        for _ in 0..count {
+            stream.read_exact(&mut size)?;
+            let start = u64::from_le_bytes(size);
+            stream.read_exact(&mut size)?;
+            let len = u64::from_le_bytes(size);
+            if start < previous_end
+                || start > expected_size
+                || len > expected_size - start
+                || len == 0
+            {
+                return Err(io::Error::other("Invalid Manifest extent"));
+            }
+            previous_end = start + len;
+            zero_ranges.push((start, len));
+        }
+        Ok(Self {
+            stream,
+            buf: Vec::new(),
+            zero_ranges,
+        })
+    }
+    pub(crate) fn shutdown_fd(&self) -> io::Result<OwnedFd> {
+        Ok(self.stream.try_clone()?.into())
+    }
+}
+impl Drop for ManifestUffdMemorySource {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+impl UffdMemorySource for ManifestUffdMemorySource {
+    fn resolve(&mut self, fd: BorrowedFd<'_>, range: &UffdRange, page_idx: u64) -> io::Result<()> {
+        use std::io::Write;
+        if range.page_size > 2 * 1024 * 1024 {
+            return Err(io::Error::other("Unsupported Manifest page size"));
+        }
+        self.stream
+            .write_all(&range.page_source_offset(page_idx).to_le_bytes())?;
+        self.stream.write_all(&range.page_size.to_le_bytes())?;
+        self.buf.resize(range.page_size as usize, 0);
+        self.stream.read_exact(&mut self.buf)?;
+        let addr = range.page_addr(page_idx);
+        match copy(fd, addr, self.buf.as_ptr(), range.page_size) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => wake(fd, addr, range.page_size),
+            Err(e) => Err(e),
+        }
+    }
+    fn requires_uffd_minor_mode(&self) -> bool {
+        false
+    }
+}
+
 /// Memory source that provides pages content over a socket.
 pub(crate) struct SocketUffdMemorySource {
     stream: SocketStream,
@@ -545,4 +639,48 @@ pub(crate) fn page_present(addr: u64) -> Result<bool, Error> {
         return Err(Error::last_os_error());
     }
     Ok(vec & 1 != 0)
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    #[test]
+    fn manifest_source_checks_size_and_sparse_bounds() {
+        for (size, offset, length, valid) in [
+            (8192_u64, 4096_u64, 4096_u64, true),
+            (4096, 0, 4096, false),
+            (8192, 8192, 4096, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("pages");
+            let descriptor = dir.path().join("descriptor");
+            std::fs::write(
+                &descriptor,
+                serde_json::to_vec(&serde_json::json!({
+                    "socket":socket,"logical_bytes":8192
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let bytes: Vec<u8> = [size, 1, offset, length]
+                    .iter()
+                    .flat_map(|n| n.to_le_bytes())
+                    .collect();
+                let _ = stream.write_all(&bytes);
+                let mut b = [0];
+                let _ = stream.read(&mut b);
+            });
+            let result = ManifestUffdMemorySource::open(&descriptor, 8192);
+            assert_eq!(result.is_ok(), valid);
+            drop(result);
+            server.join().unwrap();
+        }
+    }
 }
