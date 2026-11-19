@@ -3196,6 +3196,29 @@ impl Vm {
             .regenerate_vmgenid()
             .map_err(Error::DeviceManager)?;
 
+        if self.memory_manager.lock().unwrap().incremental_memory() {
+            let config = self.config.lock().unwrap();
+            if !is_restore_cow_supported(&config)
+                || config.balloon.is_some()
+                || config.memory.shared
+            {
+                return Err(Error::Restore(MigratableError::Restore(anyhow!(
+                    "Incremental memory requires fixed private RAM without ballooning or passthrough"
+                ))));
+            }
+            drop(config);
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .enable_snapshot_dirty()
+                .map_err(|e| Error::Restore(MigratableError::Restore(e.into())))?;
+            self.device_manager
+                .lock()
+                .unwrap()
+                .start_dirty_log()
+                .map_err(Error::Restore)?;
+        }
+
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
@@ -3275,6 +3298,18 @@ impl Vm {
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.memory_manager.lock().unwrap().guest_memory()
+    }
+
+    pub fn incremental_memory(&self) -> bool {
+        self.memory_manager.lock().unwrap().incremental_memory()
+    }
+
+    pub fn finish_incremental_restore_for_fork(&mut self) -> Result<()> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .finish_incremental_restore_for_fork()
+            .map_err(|e| Error::Restore(MigratableError::Restore(e.into())))
     }
 
     pub fn restoring(&self) -> bool {
@@ -3574,6 +3609,15 @@ impl Snapshottable for Vm {
             return Err(MigratableError::Snapshot(anyhow!(
                 "Trying to snapshot while VM is running"
             )));
+        }
+
+        let incremental = self.memory_manager.lock().unwrap().incremental_memory();
+        if incremental {
+            let dirty = self.dirty_log()?;
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .accumulate_snapshot_dirty(&dirty);
         }
 
         // Reuse what the CPU manager generated at VM creation from the same

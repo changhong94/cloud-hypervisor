@@ -3,18 +3,20 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 
 use super::QcowDisk;
 use super::backing::Qcow2Backing;
 use super::common::apply_dealloc_action;
-use super::metadata::{BackingRead, ClusterWriteMapping};
+use super::metadata::{BackingRead, ClusterReadMapping, ClusterWriteMapping};
 use crate::AlignedFile;
 
 #[derive(Debug, Default)]
 pub struct MergeStats {
     pub clusters: u64,
     pub bytes_read: u64,
+    pub bytes_cloned: u64,
     pub zero_clusters: u64,
     pub shadowed_clusters: u64,
 }
@@ -34,6 +36,55 @@ pub fn merge_layers_cancellable(
     destination: &File,
     layers_oldest_first: &[File],
     cancelled: impl Fn() -> bool,
+) -> io::Result<MergeStats> {
+    merge_impl(destination, layers_oldest_first, cancelled, false)
+}
+
+/// Offline-only merge using filesystem CoW for ordinary allocated clusters.
+/// Unsupported filesystems fall back to copying. Live merge workers retain
+/// their existing syscall policy and use `merge_layers_cancellable` instead.
+pub fn merge_layers_reflink(
+    destination: &File,
+    layers_oldest_first: &[File],
+    cancelled: impl Fn() -> bool,
+) -> io::Result<MergeStats> {
+    merge_impl(destination, layers_oldest_first, cancelled, true)
+}
+
+fn clone_cluster(
+    source: &impl AsRawFd,
+    source_offset: u64,
+    target: &File,
+    target_offset: u64,
+    length: u64,
+) -> io::Result<bool> {
+    let range = libc::file_clone_range {
+        src_fd: i64::from(source.as_raw_fd()),
+        src_offset: source_offset,
+        src_length: length,
+        dest_offset: target_offset,
+    };
+    // SAFETY: both FDs stay open and range is a valid, immutable ioctl argument.
+    // Inputs are sealed; destination is exclusively owned and unpublished.
+    if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONERANGE, &range) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
+    ) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn merge_impl(
+    destination: &File,
+    layers_oldest_first: &[File],
+    cancelled: impl Fn() -> bool,
+    mut reflink: bool,
 ) -> io::Result<MergeStats> {
     if !AlignedFile::new(destination.try_clone()?, false).is_writable() {
         return Err(io::Error::other("Compaction output must be writable"));
@@ -96,8 +147,38 @@ pub fn merge_layers_cancellable(
                         "Disk merge cancelled",
                     ));
                 }
-                reader.read_at(offset, &mut buffer)?;
                 stats.clusters += 1;
+                if reflink && size - offset >= cluster_size {
+                    let mappings = reader.metadata.map_clusters_for_read(
+                        offset,
+                        cluster_size as usize,
+                        reader.backing_file.is_some(),
+                    )?;
+                    if let [
+                        ClusterReadMapping::Allocated {
+                            offset: source_offset,
+                            length,
+                        },
+                    ] = mappings.as_slice()
+                        && *length == cluster_size
+                    {
+                        let ClusterWriteMapping::Allocated {
+                            offset: target_offset,
+                        } = target.metadata.map_cluster_for_write(offset, None)?;
+                        if clone_cluster(
+                            &reader.data_file,
+                            *source_offset,
+                            destination,
+                            target_offset,
+                            cluster_size,
+                        )? {
+                            stats.bytes_cloned += cluster_size;
+                            continue;
+                        }
+                        reflink = false;
+                    }
+                }
+                reader.read_at(offset, &mut buffer)?;
                 stats.bytes_read += (size - offset).min(cluster_size);
                 if buffer.iter().all(|&byte| byte == 0) {
                     // A zero marker must hide even nonzero raw backing data.
@@ -217,6 +298,48 @@ mod tests {
         expected[cluster..2 * cluster].fill(21);
         expected[cluster + 512..cluster + 1024].fill(30);
         assert_eq!(disk.read_all_at(0, expected.len()), expected);
+        let cloned = TempFile::new().unwrap();
+        create_image(cloned.as_file(), size, Some(&base_config)).unwrap();
+        let cloned_stats = merge_layers_reflink(
+            cloned.as_file(),
+            &[
+                File::open(lower.as_path()).unwrap(),
+                File::open(upper.as_path()).unwrap(),
+            ],
+            || false,
+        )
+        .unwrap();
+        let probe = TempFile::new().unwrap();
+        if clone_cluster(base.as_file(), 0, probe.as_file(), 0, cluster as u64).unwrap() {
+            assert_eq!(cloned_stats.bytes_cloned, cluster as u64);
+        } else {
+            assert_eq!(cloned_stats.bytes_cloned, 0);
+        }
+        assert_eq!(
+            cloned_stats.bytes_read + cloned_stats.bytes_cloned,
+            2 * cluster as u64
+        );
+        {
+            let cloned_disk = QcowDisk::new(
+                cloned.as_file().try_clone().unwrap(),
+                false,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(cloned_disk.read_all_at(0, expected.len()), expected);
+            cloned_disk.write_all_at(cluster as u64 + 512, &[77; 512]);
+        }
+        let source_disk = QcowDisk::new(
+            File::open(upper.as_path()).unwrap(),
+            false,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(source_disk.read_all_at(0, expected.len()), expected);
         let old = QcowDisk::new(
             File::open(lower.as_path()).unwrap(),
             false,

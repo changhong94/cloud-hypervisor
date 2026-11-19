@@ -3,16 +3,56 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-//! Sparse file-copy helpers shared between snapshot/restore paths (the
-//! `MemoryManager` snapshot writer and the offload daemon). Holes are
-//! detected via `lseek(SEEK_DATA)`/`lseek(SEEK_HOLE)` and left as holes in
-//! the destination, with a dense fallback when the source filesystem does
-//! not support sparse-seek.
+//! Sparse snapshot/copy helpers for the `MemoryManager` and offload daemon.
+//! File copies preserve holes using `lseek(SEEK_DATA)`/`lseek(SEEK_HOLE)`,
+//! with a dense fallback when sparse-seek is unsupported. Private guest RAM
+//! is read from memory instead and all-zero pages are left as holes.
 
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
+
+/// Snapshot a quiesced memory range into a newly created, zero-filled file.
+/// Read actual guest bytes, not the mapping's backing file: private CoW pages
+/// (including pages overwritten with zeroes) need not match that file.
+/// Memory use is bounded; adjacent nonzero pages share one write operation.
+pub fn write_memory_sparse(
+    destination: &File,
+    destination_offset: u64,
+    length: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut offset = 0;
+    let mut written = 0;
+    while offset < length {
+        let count = (length - offset).min(buffer.len() as u64) as usize;
+        read(offset, &mut buffer[..count])?;
+        let mut run = None;
+        for (index, page) in buffer[..count].chunks(4096).enumerate() {
+            let start = index * 4096;
+            if page.iter().any(|byte| *byte != 0) {
+                run.get_or_insert(start);
+            } else if let Some(begin) = run.take() {
+                destination.write_all_at(
+                    &buffer[begin..start],
+                    destination_offset + offset + begin as u64,
+                )?;
+                written += (start - begin) as u64;
+            }
+        }
+        if let Some(begin) = run {
+            destination.write_all_at(
+                &buffer[begin..count],
+                destination_offset + offset + begin as u64,
+            )?;
+            written += (count - begin) as u64;
+        }
+        offset += count as u64;
+    }
+    Ok(written)
+}
 
 /// Find the next populated (data) extent in `[cursor, end)` of `fd`,
 /// driven by `lseek(SEEK_DATA)` / `lseek(SEEK_HOLE)`. Returns
@@ -151,6 +191,35 @@ pub fn copy_region(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_memory_snapshot_preserves_zeroes_boundaries_and_errors() {
+        use std::os::unix::fs::MetadataExt;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut data = vec![0; 2 * 1024 * 1024 + 17];
+        data[0] = 1;
+        data[1024 * 1024 - 1] = 2;
+        data[1024 * 1024] = 3;
+        *data.last_mut().unwrap() = 4;
+        file.as_file().set_len(data.len() as u64 + 4096).unwrap();
+        let written =
+            super::write_memory_sparse(file.as_file(), 4096, data.len() as u64, |off, buf| {
+                buf.copy_from_slice(&data[off as usize..off as usize + buf.len()]);
+                Ok(())
+            })
+            .unwrap();
+        let actual = std::fs::read(file.path()).unwrap();
+        assert_eq!(&actual[4096..], data);
+        assert!(actual[..4096].iter().all(|b| *b == 0));
+        assert_eq!(written, 3 * 4096 + 17);
+        assert!(file.as_file().metadata().unwrap().blocks() * 512 < data.len() as u64);
+        assert!(
+            super::write_memory_sparse(file.as_file(), 0, 1, |_, _| Err(std::io::Error::other(
+                "read failure"
+            )))
+            .is_err()
+        );
+    }
+
     use std::io::Write;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
     use std::os::unix::fs::FileExt;
@@ -413,5 +482,112 @@ mod tests {
         assert!(restored[4096 * 5..4096 * 26].iter().all(|&b| b == 0));
         assert!(restored[4096 * 26..4096 * 30].iter().all(|&b| b == 0xBB));
         assert!(restored[4096 * 30..].iter().all(|&b| b == 0));
+    }
+}
+
+/// Patch a reflink clone from frozen guest bytes. Equality is checked against
+/// the clone, not dirty bits, covering both device and vCPU writes and zeroes.
+/// The caller must keep the VM quiesced until its ordinary persistence barrier.
+pub fn write_memory_delta_from_clone(
+    destination: &File,
+    destination_offset: u64,
+    length: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut guest = vec![0; 1024 * 1024];
+    let mut base = vec![0; guest.len()];
+    let mut offset = 0;
+    let mut written = 0;
+    while offset < length {
+        let count = (length - offset).min(guest.len() as u64) as usize;
+        read(offset, &mut guest[..count])?;
+        // Do not populate page cache for the clone's holes. Reading every hole
+        // would allocate cache for the entire configured RAM, even though the
+        // snapshot is sparse. SEEK_DATA is only an optimization; unsupported
+        // filesystems still use a complete, byte-correct read.
+        base[..count].fill(0);
+        let begin = destination_offset + offset;
+        let end = begin + count as u64;
+        let mut cursor = begin;
+        while cursor < end {
+            match next_data_extent(destination.as_fd(), cursor, end) {
+                Ok(Some((data, len))) => {
+                    let start = (data - begin) as usize;
+                    destination.read_exact_at(&mut base[start..start + len as usize], data)?;
+                    cursor = data + len;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    destination.read_exact_at(&mut base[..count], begin)?;
+                    break;
+                }
+            }
+        }
+        let mut run = None;
+        for start in (0..count).step_by(4096) {
+            let end = (start + 4096).min(count);
+            if guest[start..end] != base[start..end] {
+                run.get_or_insert(start);
+            } else if let Some(begin) = run.take() {
+                destination.write_all_at(&guest[begin..start], destination_offset + offset + begin as u64)?;
+                written += (start - begin) as u64;
+            }
+        }
+        if let Some(begin) = run {
+            destination.write_all_at(&guest[begin..count], destination_offset + offset + begin as u64)?;
+            written += (count - begin) as u64;
+        }
+        offset += count as u64;
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+mod clone_delta_tests {
+    use super::*;
+    #[test]
+    fn patches_zero_nonzero_and_partial_pages_without_changing_baseline() {
+        let base = tempfile::tempfile().unwrap();
+        let output = tempfile::tempfile().unwrap();
+        let original = vec![0x73; 3 * 4096 + 29];
+        base.write_all_at(&original, 0).unwrap();
+        output.write_all_at(&original, 0).unwrap();
+        let mut guest = original.clone();
+        guest[..4096].fill(0);
+        guest[8192..].fill(0x92);
+        let written = write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o, b| {
+            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]); Ok(())
+        }).unwrap();
+        assert_eq!(written, (8192 + 29) as u64);
+        let mut actual = vec![0; guest.len()];
+        output.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, guest);
+        base.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, original);
+        assert_eq!(write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o,b| {
+            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]); Ok(())
+        }).unwrap(), 0);
+    }
+    #[test]
+    fn sparse_baseline_holes_and_data_match_frozen_memory() {
+        let output = tempfile::tempfile().unwrap();
+        let mut guest = vec![0; 3 * 1024 * 1024];
+        output.set_len(guest.len() as u64).unwrap();
+        output.write_all_at(&[7; 4096], 1024 * 1024 + 4096).unwrap();
+        guest[1024 * 1024 + 4096..1024 * 1024 + 8192].fill(7);
+        guest[..4096].fill(5);
+        let written = write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o, b| {
+            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]); Ok(())
+        }).unwrap();
+        assert_eq!(written, 4096);
+        let mut actual = vec![0; guest.len()];
+        output.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, guest);
+    }
+    #[test]
+    fn read_failure_is_not_reported_as_a_complete_snapshot() {
+        let output = tempfile::tempfile().unwrap();
+        output.set_len(4096).unwrap();
+        assert!(write_memory_delta_from_clone(&output, 0, 4096, |_,_| Err(io::Error::other("injected"))).is_err());
     }
 }

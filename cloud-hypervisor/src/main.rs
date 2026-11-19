@@ -560,6 +560,11 @@ fn get_cli_options_sorted(
             .num_args(1..)
             .action(ArgAction::Append)
             .group("vm-config"),
+        Arg::new("compact-restored-disk")
+            .long("compact-restored-disk")
+            .num_args(1)
+            .conflicts_with("vm-config")
+            .help("Compact an owned offline QCOW2 restore leaf; do not start a VM"),
         Arg::new("version")
             .short('V')
             .long("version")
@@ -1202,6 +1207,14 @@ fn main() {
             println!("Enabled features: {:?}", vmm::feature_list());
         }
 
+        return;
+    }
+
+    if let Some(path) = cmd_arguments.get_one::<String>("compact-restored-disk") {
+        if let Err(error) = vmm::compact_restored_disk(Path::new(path)) {
+            eprintln!("Cannot compact restored disk: {error}");
+            process::exit(1);
+        }
         return;
     }
 

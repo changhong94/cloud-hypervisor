@@ -224,6 +224,51 @@ fn identity(path: &Path) -> io::Result<(u64, u64)> {
     Ok((meta.dev(), meta.ino()))
 }
 
+/// Compact a newly staged, offline restore disk before a VM opens it.
+/// The caller owns this directory's links; the original checkpoint is untouched.
+/// No raw base reads are required, including for lazy Manifest-backed disks.
+pub fn compact_restored_disk(active: &Path) -> io::Result<()> {
+    use block::fcntl::{LockGranularity, LockType, try_acquire_lock};
+    let directory = directory(
+        active
+            .parent()
+            .ok_or_else(|| invalid("Missing disk directory"))?,
+    )?;
+    if active.canonicalize()? != active || fs::symlink_metadata(active)?.nlink() != 1 {
+        return Err(invalid(
+            "Restore leaf must be a private regular file without aliases",
+        ));
+    }
+    let leaf = OpenOptions::new().read(true).write(true).open(active)?;
+    try_acquire_lock(&leaf, LockType::Write, LockGranularity::WholeFile)
+        .map_err(io::Error::other)?;
+    let history = chain(active, &directory, block::ImageType::Qcow2)?;
+    if history.paths.len() < COMPACT_AT_FILES {
+        return Ok(());
+    }
+    let identities = history
+        .paths
+        .iter()
+        .map(|p| identity(p))
+        .collect::<io::Result<Vec<_>>>()?;
+    let (publish, command) = mpsc::channel();
+    publish
+        .send(MergeCommand::Publish)
+        .map_err(io::Error::other)?;
+    merge_worker(
+        history,
+        identities,
+        directory.clone(),
+        active.to_owned(),
+        Arc::new(AtomicBool::new(false)),
+        command,
+        false,
+    )?;
+    // Fail restoration on a persistence error. The caller collects only its
+    // copied paths after checking every configured disk's remaining dependencies.
+    File::open(directory)?.sync_all()
+}
+
 /// Called by the supervisor, never by a narrowed VMM worker. Building a fresh
 /// candidate does not change the backing namespace during VM restoration.
 pub(crate) fn start_merge(config: &VmConfig) -> io::Result<Option<Arc<MergeJob>>> {
@@ -256,7 +301,7 @@ pub(crate) fn start_merge(config: &VmConfig) -> io::Result<Option<Arc<MergeJob>>
     let (publish, command) = mpsc::channel();
     let worker = thread::Builder::new()
         .name("disk-merge".into())
-        .spawn(move || merge_worker(history, identities, directory, active, stop, command))?;
+        .spawn(move || merge_worker(history, identities, directory, active, stop, command, true))?;
     Ok(Some(Arc::new(MergeJob {
         cancelled,
         publish,
@@ -271,6 +316,7 @@ fn merge_worker(
     active: PathBuf,
     stop: Arc<AtomicBool>,
     command: mpsc::Receiver<MergeCommand>,
+    collect_unused: bool,
 ) -> io::Result<()> {
     // Do not compete with runtime reconstruction during the pause.
     let publish_now = match command.recv() {
@@ -308,17 +354,21 @@ fn merge_worker(
             .rev()
             .map(File::open)
             .collect::<io::Result<Vec<_>>>()?;
-        let stats =
-            qcow::merge_layers_cancellable(&file, &inputs, || stop.load(Ordering::Acquire))?;
+        let stats = if collect_unused {
+            qcow::merge_layers_cancellable(&file, &inputs, || stop.load(Ordering::Acquire))?
+        } else {
+            qcow::merge_layers_reflink(&file, &inputs, || stop.load(Ordering::Acquire))?
+        };
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o400))?;
         file.sync_all()?;
         eprintln!(
-            "VM_FORK disk_compact input_files={} clusters={} bytes_read={} zero_clusters={} elapsed_ms={:.3} background=true shadowed_clusters={}",
+            "VM_FORK disk_compact input_files={} clusters={} bytes_read={} zero_clusters={} elapsed_ms={:.3} background={collect_unused} bytes_cloned={} shadowed_clusters={}",
             history.paths.len() - 1,
             stats.clusters,
             stats.bytes_read,
             stats.zero_clusters,
             started.elapsed().as_secs_f64() * 1000.0,
+            stats.bytes_cloned,
             stats.shadowed_clusters
         );
         if !publish_now {
@@ -349,7 +399,13 @@ fn merge_worker(
         // A failure after rename is not a rollback: the new chain is valid.
         if let Err(error) = File::open(&directory)
             .and_then(|d| d.sync_all())
-            .and_then(|_| collect_garbage(&directory, &active))
+            .and_then(|_| {
+                if collect_unused {
+                    collect_garbage(&directory, &active)
+                } else {
+                    Ok(())
+                }
+            })
         {
             eprintln!("VM_FORK disk_gc deferred: {error}");
         }
@@ -398,6 +454,7 @@ pub(crate) struct PreparedBranch {
     dirs: Vec<PathBuf>,
     size: u64,
     history_links: usize,
+    readonly_paths: Vec<(usize, PathBuf)>,
 }
 
 impl Drop for PreparedBranch {
@@ -483,6 +540,35 @@ pub(crate) fn prepare(
                 }
             }
         }
+        // Restored readonly Manifest images also have owned QCOW dependency
+        // names. Give the child its own links before parent destruction.
+        let mut readonly_paths = Vec::new();
+        for (idx, ro) in config.disks.iter().flatten().enumerate() {
+            if !ro.readonly || ro.image_type != block::ImageType::Qcow2 {
+                continue;
+            }
+            let Some(source) = &ro.path else {
+                continue;
+            };
+            if source.parent() != Some(parent.as_path()) {
+                continue;
+            }
+            let dependencies = chain(source, parent, ro.image_type)?;
+            for path in dependencies.paths {
+                let link = child.join(path.file_name().unwrap());
+                if link.exists() {
+                    let a = fs::metadata(&path)?;
+                    let b = fs::metadata(&link)?;
+                    if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+                        return Err(invalid("Conflicting readonly disk history"));
+                    }
+                } else {
+                    fs::hard_link(&path, &link)?;
+                    created.push(link);
+                }
+            }
+            readonly_paths.push((idx, child.join(source.file_name().unwrap())));
+        }
         let backing_config = BackingFileConfig {
             path: backing,
             format: Some(history.format),
@@ -519,9 +605,9 @@ pub(crate) fn prepare(
         for dir in [parent, child] {
             File::open(dir)?.sync_all()?;
         }
-        Ok((leaves, opens))
+        Ok((leaves, opens, readonly_paths))
     })();
-    let (leaves, opens) = match result {
+    let (leaves, opens, readonly_paths) = match result {
         Ok(prepared) => prepared,
         Err(error) => {
             for path in created.iter().rev() {
@@ -544,6 +630,7 @@ pub(crate) fn prepare(
         dirs,
         size: history.size,
         history_links: history.paths.len(),
+        readonly_paths,
     }))
 }
 
@@ -576,6 +663,9 @@ pub(crate) fn commit(
     disk.backing_files = true;
     let mut child_disks = config.disks.clone().unwrap();
     child_disks[prepared.index].path = Some(prepared.leaves[1].clone());
+    for (index, path) in &prepared.readonly_paths {
+        child_disks[*index].path = Some(path.clone());
+    }
     // Publication is infallible after sealing. Disarm rollback before GC.
     prepared.created.clear();
     prepared.dirs.clear();
@@ -903,6 +993,48 @@ mod tests {
             branch(&mut config, &request, &format!("generation-{generation}")).unwrap();
         }
         (config, request)
+    }
+
+    #[test]
+    fn offline_restore_compaction_preserves_peers_and_rejects_live_writer() {
+        use block::fcntl::{LockGranularity, LockType, try_acquire_lock};
+        let root = TempDir::new().unwrap();
+        let (config, request) = deep_fixture(root.path());
+        let active = config.disks.as_ref().unwrap()[0].path.as_ref().unwrap();
+        let parent = request.parent_disk_dir.as_ref().unwrap();
+        let old = chain(active, parent, block::ImageType::Qcow2).unwrap();
+        let peer = request
+            .child_disk_dir
+            .as_ref()
+            .unwrap()
+            .join(old.paths[1].file_name().unwrap());
+        let peer_bytes = fs::read(&peer).unwrap();
+        let writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(active)
+            .unwrap();
+        try_acquire_lock(&writer, LockType::Write, LockGranularity::WholeFile).unwrap();
+        assert!(compact_restored_disk(active).is_err());
+        assert_eq!(
+            chain(active, parent, block::ImageType::Qcow2)
+                .unwrap()
+                .paths,
+            old.paths
+        );
+        drop(writer);
+        compact_restored_disk(active).unwrap();
+        assert_eq!(
+            chain(active, parent, block::ImageType::Qcow2)
+                .unwrap()
+                .paths
+                .len(),
+            3
+        );
+        assert_eq!(fs::read(peer).unwrap(), peer_bytes);
+        ready_to_pause(&config).unwrap();
+        // Repeated invocation is safe and does not require another merge.
+        compact_restored_disk(active).unwrap();
     }
 
     #[test]

@@ -217,6 +217,9 @@ impl BackingFile {
                         )
                     })?
                     .0;
+                let size = crate::manifest::Descriptor::read(&raw_file)
+                    .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?
+                    .map_or(size, |d| d.size);
                 (BackingKind::Raw(raw_file), size)
             }
             ImageType::Qcow2 => {

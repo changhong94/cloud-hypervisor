@@ -88,6 +88,7 @@ pub mod device_manager;
 pub mod device_tree;
 pub mod fork;
 mod fork_disk;
+pub use fork_disk::compact_restored_disk;
 mod fork_retirement;
 #[cfg(feature = "guest_debug")]
 mod gdb;
@@ -2857,7 +2858,7 @@ impl RequestHandler for Vmm {
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
-                if vm.restoring() {
+                if vm.restoring() && !vm.incremental_memory() {
                     return Err(VmError::VmRestoring);
                 }
                 // Drain console_info so that FDs are not reused

@@ -620,6 +620,7 @@ impl Vmm {
             VmOwnership::Migration { .. } => return Err(Error::VmMigrating),
             VmOwnership::None => return Err(Error::VmNotRunning),
         };
+        vm.finish_incremental_restore_for_fork()?;
         if vm.restoring() {
             return Err(Error::VmRestoring);
         }
