@@ -355,6 +355,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, BLKDISCARD as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKZEROOUT as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIOCLEX as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, libc::FICLONE as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFFLAGS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFHWADDR)?],

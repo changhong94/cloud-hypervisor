@@ -263,6 +263,7 @@ pub struct MemoryManager {
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
     incremental_memory: Option<IncrementalMemory>,
+    local_snapshot_hint: Option<PathBuf>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -1046,7 +1047,7 @@ impl MemoryManager {
         }
         let memory_file = OpenOptions::new()
             .read(true)
-            .open(file_path)
+            .open(&file_path)
             .map_err(Error::SnapshotOpen)?;
         // A range mapped past EOF faults SIGBUS at run time, not restore time.
         let mapped_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
@@ -1057,7 +1058,16 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)
+        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        // Keep a prior immutable template hint across pause/resume. The fresh
+        // restore bundle may be unlinked by the sandboxer after resume; using
+        // that temporary name would lose sharing on the next save. This is
+        // never a restore dependency: send() compares all guest bytes and
+        // falls back to sparse capture if the hint is absent or unsupported.
+        if self.local_snapshot_hint.is_none() {
+            self.local_snapshot_hint = Some(file_path.canonicalize().unwrap_or(file_path));
+        }
+        Ok(())
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -2478,6 +2488,7 @@ impl MemoryManager {
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
             incremental_memory: restore_data.and_then(|d| d.incremental_memory.clone()),
+            local_snapshot_hint: restore_data.and_then(|d| d.local_snapshot_hint.clone()),
             memory_zones,
             guest_ram_mappings: Vec::new(),
             retained_ram_slots: None,
@@ -3377,6 +3388,7 @@ impl MemoryManager {
     pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
         MemoryManagerSnapshotData {
             incremental_memory: self.incremental_memory.clone(),
+            local_snapshot_hint: self.local_snapshot_hint.clone(),
             memory_ranges: self.snapshot_memory_ranges.clone(),
             guest_ram_mappings: self.guest_ram_mappings.clone(),
             start_of_device_area: self.start_of_device_area.0,
@@ -3886,6 +3898,9 @@ struct IncrementalMemory {
 pub struct MemoryManagerSnapshotData {
     #[serde(default)]
     incremental_memory: Option<IncrementalMemory>,
+    // Optional same-host optimization; never required to restore the snapshot.
+    #[serde(default)]
+    local_snapshot_hint: Option<PathBuf>,
     memory_ranges: MemoryRangeTable,
     guest_ram_mappings: Vec<GuestRamMapping>,
     start_of_device_area: u64,
@@ -3968,12 +3983,38 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
+        // Reflink is only a space optimization. Compare every guest byte against
+        // the cloned file, so an absent/stale hint cannot lose a private write.
+        // The resulting snapshot is self-contained and uses normal durability.
+        let cloned = sparse_layout
+            && self.local_snapshot_hint.as_ref().is_some_and(|path| {
+                File::open(path).ok().is_some_and(|source| {
+                    source.metadata().is_ok_and(|m| m.len() == total_len)
+                        // SAFETY: both FDs stay live during the ioctl.
+                        && unsafe { libc::ioctl(memory_file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0
+                })
+            });
+        if sparse_layout && !cloned {
+            // An unsuccessful filesystem clone must not leave stale extents
+            // beneath zero pages skipped by the sparse fallback.
+            memory_file.set_len(0).and_then(|_| memory_file.set_len(total_len))
+                .context("Error resetting unshared snapshot").map_err(MigratableError::MigrateSend)?;
+        }
         let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
         for range in self.snapshot_memory_ranges.ranges() {
             let mut wrote_sparse = false;
-            if sparse_layout
+            if cloned {
+                let started = time::Instant::now();
+                let written = crate::sparse::write_memory_delta_from_clone(
+                    &memory_file, file_cursor, range.length,
+                    |offset, bytes| guest_memory.read_slice(bytes, GuestAddress(range.gpa + offset)).map_err(io::Error::other),
+                ).context("Error patching reflinked snapshot").map_err(MigratableError::MigrateSend)?;
+                info!("SNAPSHOT_MEMORY_REFLINK logical_bytes={} written_bytes={} elapsed_us={}", range.length, written, started.elapsed().as_micros());
+                wrote_sparse = true;
+            }
+            if !wrote_sparse && sparse_layout
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
                 && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
                 && let Some(file_offset) = region.file_offset()
@@ -4636,6 +4677,7 @@ pub(crate) fn save_frozen_memory(
     // prepare_fork completed any UFFD faults before the address space split.
     // The capture is a new full payload, independent of the source's delta graph.
     data.incremental_memory = None;
+    data.local_snapshot_hint = None;
     let f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -4678,6 +4720,7 @@ mod frozen_capture_tests {
             length: 4096,
         });
         let data = MemoryManagerSnapshotData {
+            local_snapshot_hint: Some(PathBuf::from("source-only")),
             incremental_memory: Some(IncrementalMemory {
                 base: MemoryBaseline {
                     manifest: "source-only".into(),
@@ -4702,6 +4745,7 @@ mod frozen_capture_tests {
         let saved = save_frozen_memory(&snapshot, &memory, directory.path()).unwrap();
         let restored: MemoryManagerSnapshotData = saved.to_state().unwrap();
         assert!(restored.incremental_memory.is_none());
+        assert!(restored.local_snapshot_hint.is_none());
         assert!(
             snapshot
                 .to_state::<MemoryManagerSnapshotData>()

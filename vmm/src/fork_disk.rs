@@ -607,6 +607,9 @@ pub(crate) fn prepare(
                 .map_err(|_| invalid("Disk leaf worker panicked"))?;
             Ok(vec![parent?, child?])
         })?;
+        for dir in [parent, child] {
+            File::open(dir)?.sync_all()?;
+        }
         Ok((leaves, opens, readonly_paths))
     })();
     let (leaves, opens, readonly_paths) = match result {
