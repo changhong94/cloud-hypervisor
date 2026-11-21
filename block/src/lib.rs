@@ -13,6 +13,7 @@ pub mod error;
 pub mod factory;
 #[path = "io/mod.rs"]
 mod io_impl;
+pub mod native_export;
 pub use io_impl::{async_io, fcntl, request};
 pub(crate) mod aligned_buffer;
 pub mod aligned_file;

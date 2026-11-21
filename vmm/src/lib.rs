@@ -2818,7 +2818,9 @@ impl RequestHandler for Vmm {
     fn vm_preflush(&mut self) -> std::io::Result<()> {
         match &self.vm {
             VmOwnership::Owned(vm) => vm.preflush_fork_disks(),
-            _ => Err(std::io::Error::other("VM is not available for disk preflush")),
+            _ => Err(std::io::Error::other(
+                "VM is not available for disk preflush",
+            )),
         }
     }
 

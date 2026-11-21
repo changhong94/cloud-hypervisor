@@ -135,9 +135,14 @@ where
             if valid {
                 // Linux returns this event buffer only after updating its CID
                 // and resetting connected sockets. Capture before publishing it.
-                self.reset_ack_avail = Some(self.queues[2]
-                    .avail_idx(chain.memory(), Ordering::Acquire)
-                    .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset avail: {e}")))?.0);
+                self.reset_ack_avail = Some(
+                    self.queues[2]
+                        .avail_idx(chain.memory(), Ordering::Acquire)
+                        .map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!("vsock reset avail: {e}"))
+                        })?
+                        .0,
+                );
             }
             self.queues[2]
                 .add_used(chain.memory(), head, if valid { 4 } else { 0 })
@@ -153,11 +158,19 @@ where
     }
 
     fn reset_complete(&mut self) -> result::Result<bool, EpollHelperError> {
-        if self.reset_pending { return Ok(false); }
+        if self.reset_pending {
+            return Ok(false);
+        }
         if let Some(before) = self.reset_ack_avail {
-            let current = self.queues[2].avail_idx(&*self.mem.memory(), Ordering::Acquire)
-                .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset acknowledgement: {e}")))?.0;
-            if current == before { return Ok(false); }
+            let current = self.queues[2]
+                .avail_idx(&*self.mem.memory(), Ordering::Acquire)
+                .map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("vsock reset acknowledgement: {e}"))
+                })?
+                .0;
+            if current == before {
+                return Ok(false);
+            }
             self.reset_ack_avail = None;
         }
         Ok(true)
@@ -308,7 +321,9 @@ where
             self.backend_registered = true;
         }
         let ev_type = event.data as u16;
-        if ev_type == BACKEND_EVENT && !ready { return Ok(()); }
+        if ev_type == BACKEND_EVENT && !ready {
+            return Ok(());
+        }
         match ev_type {
             RX_QUEUE_EVENT => {
                 debug!("vsock: RX queue event");
@@ -926,8 +941,10 @@ mod tests {
         ctx.handler.handle_event(&mut helper, &event).unwrap();
         // Publishing the RESET interrupt is not guest acknowledgement. In this
         // interleaving the guest has not run the reset worker yet.
-        assert!(ctx.handler.backend.read().unwrap().evset.is_none(),
-            "backend accepted a new connection before the guest reset completed");
+        assert!(
+            ctx.handler.backend.read().unwrap().evset.is_none(),
+            "backend accepted a new connection before the guest reset completed"
+        );
         // Linux posts the consumed event buffer only after aborting old sockets.
         ctx.guest_evvq.avail.ring[1].set(0);
         ctx.guest_evvq.avail.idx.set(2);

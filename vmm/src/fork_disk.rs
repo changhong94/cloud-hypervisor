@@ -113,6 +113,10 @@ fn chain(source: &Path, parent: &Path, image_type: block::ImageType) -> io::Resu
 }
 
 pub(crate) fn validate(config: &VmConfig, request: &VmForkConfig) -> io::Result<()> {
+    if request.native_child_disks.is_some() {
+        return validate_native(config, request);
+    }
+
     let writable: Vec<_> = config
         .disks
         .iter()
@@ -476,6 +480,9 @@ pub(crate) fn prepare(
     operation: &str,
 ) -> io::Result<Option<PreparedBranch>> {
     validate(config, request)?;
+    if request.native_child_disks.is_some() {
+        return Ok(None);
+    }
     let Some(index) = config
         .disks
         .as_ref()
@@ -797,7 +804,7 @@ mod tests {
         disk.write_all_at(65536 - 512, &[31; 1024]);
         let next = VmForkConfig {
             snapshot_directory: None,
-child_disk_dir: Some(root.path().join("next")),
+            child_disk_dir: Some(root.path().join("next")),
             ..request.clone()
         };
         let prepared = prepare(&config, &next, "prepared").unwrap();
@@ -873,7 +880,7 @@ child_disk_dir: Some(root.path().join("next")),
         );
         let next = VmForkConfig {
             snapshot_directory: None,
-parent_disk_dir: Some(child_dir.clone()),
+            parent_disk_dir: Some(child_dir.clone()),
             child_disk_dir: Some(root.path().join("grandchild")),
             ..request.clone()
         };
@@ -907,7 +914,7 @@ parent_disk_dir: Some(child_dir.clone()),
         fs::write(&collision, b"keep me").unwrap();
         let next = VmForkConfig {
             snapshot_directory: None,
-child_disk_dir: Some(root.path().join("next")),
+            child_disk_dir: Some(root.path().join("next")),
             ..request
         };
         let old = config.disks.as_ref().unwrap()[0].path.clone().unwrap();
@@ -1192,5 +1199,121 @@ child_disk_dir: Some(root.path().join("next")),
             0
         );
         assert!(!request.parent_disk_dir.unwrap().exists());
+    }
+}
+
+// Native export paths are host capabilities, never guest-provided paths. The
+// controller must pin durable checkpoint branches before requesting this fork.
+fn validate_native(config: &VmConfig, request: &VmForkConfig) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let paths = request.native_child_disks.as_ref().unwrap();
+    let disks = config
+        .disks
+        .as_ref()
+        .ok_or_else(|| invalid("native fork needs disks"))?;
+    if paths.len() != disks.len()
+        || request.parent_disk_dir.is_some()
+        || request.child_disk_dir.is_some()
+    {
+        return Err(invalid("native disk fork shape mismatch"));
+    }
+    let mut sources = std::collections::HashSet::new();
+    for disk in disks {
+        let original = disk
+            .path
+            .as_ref()
+            .ok_or_else(|| invalid("missing native source path"))?;
+        let metadata = fs::symlink_metadata(original)?;
+        if metadata.file_type().is_socket() {
+            sources.insert((metadata.dev(), metadata.ino()));
+        }
+    }
+    let mut targets = std::collections::HashSet::new();
+    for (disk, path) in disks.iter().zip(paths) {
+        let original = disk
+            .path
+            .as_ref()
+            .ok_or_else(|| invalid("missing native source path"))?;
+        let source = fs::symlink_metadata(original)?;
+        let target = fs::symlink_metadata(path)?;
+        if request.snapshot_directory.is_some() {
+            // An offline capture owns frozen RAM only, never a running disk
+            // device. The controller has frozen and pinned the native disk
+            // generations before calling us. Do not permit path substitution.
+            if path != original {
+                return Err(invalid("offline native capture cannot rebind disks"));
+            }
+            if !source.file_type().is_socket() && (!disk.readonly || !source.is_file()) {
+                return Err(invalid(
+                    "offline native capture requires native exports or immutable disks",
+                ));
+            }
+            continue;
+        }
+        if source.file_type().is_socket() {
+            if !path.is_absolute()
+                || !target.file_type().is_socket()
+                || sources.contains(&(target.dev(), target.ino()))
+            {
+                return Err(invalid("native child needs an independent export endpoint"));
+            }
+            if !targets.insert((target.dev(), target.ino())) {
+                return Err(invalid("native child exports alias"));
+            }
+        } else if !disk.readonly || path != original || !source.is_file() {
+            return Err(invalid(
+                "native fork permits only unchanged immutable local disks",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_export_tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+    #[test]
+    fn native_branch_rejects_aliases_and_ordinary_writable_files() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent.sock");
+        let child = root.path().join("child.sock");
+        let _p = UnixListener::bind(&parent).unwrap();
+        let _c = UnixListener::bind(&child).unwrap();
+        let config: VmConfig = serde_json::from_value(
+            serde_json::json!({"disks":[{"path":parent,"readonly":false,"image_type":"Raw"}]}),
+        )
+        .unwrap();
+        let mut request:VmForkConfig=serde_json::from_value(serde_json::json!({"child_api_socket":root.path().join("api"),"child_serial_socket":root.path().join("serial"),"native_child_disks":[child]})).unwrap();
+        validate(&config, &request).unwrap();
+        assert!(prepare(&config, &request, "native").unwrap().is_none());
+        request.native_child_disks = Some(vec![parent.clone()]);
+        assert!(validate(&config, &request).is_err());
+        request.snapshot_directory = Some(root.path().join("capture"));
+        validate(&config, &request).unwrap();
+        request.native_child_disks = Some(vec![child.clone()]);
+        assert!(validate(&config, &request).is_err());
+        request.snapshot_directory = None;
+
+        let ordinary = root.path().join("raw");
+        fs::write(&ordinary, [0; 512]).unwrap();
+        request.native_child_disks = Some(vec![ordinary]);
+        assert!(validate(&config, &request).is_err());
+        request.native_child_disks = Some(vec![child.clone()]);
+        request.parent_disk_dir = Some(root.path().to_owned());
+        assert!(validate(&config, &request).is_err());
+        request.parent_disk_dir = None;
+        let parent2 = root.path().join("parent2.sock");
+        let child2 = root.path().join("child2.sock");
+        let _p2 = UnixListener::bind(&parent2).unwrap();
+        let _c2 = UnixListener::bind(&child2).unwrap();
+        let config2:VmConfig=serde_json::from_value(serde_json::json!({"disks":[{"path":parent,"readonly":false,"image_type":"Raw"},{"path":parent2,"readonly":false,"image_type":"Raw"}]})).unwrap();
+        request.native_child_disks = Some(vec![child.clone(), child2]);
+        validate(&config2, &request).unwrap();
+        request.native_child_disks = Some(vec![child.clone(), parent.clone()]);
+        assert!(validate(&config2, &request).is_err());
+        request.native_child_disks = Some(vec![child.clone(), child]);
+        assert!(validate(&config2, &request).is_err());
     }
 }

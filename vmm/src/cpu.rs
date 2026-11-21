@@ -737,9 +737,24 @@ fn parallel_map<T: Sync, R: Send, E: Send>(
     max_threads: usize,
     min_items_per_thread: usize,
 ) -> result::Result<Vec<R>, E> {
+    // A single chunk cannot use a worker regardless of the host CPU budget.
+    // Avoid querying cgroup/affinity here: those reads can contend with pool
+    // replenishment and cost more than restoring a small VM's vCPU state.
+    if items.len() <= min_items_per_thread || max_threads == 1 {
+        crate::fork::trace_point("cpu_single_chunk");
+        // Keep invocation and first-error ordering identical to the parallel path.
+        return items
+            .iter()
+            .map(&f)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect();
+    }
+    crate::fork::trace_point("parallelism_probe_begin");
     let max_threads = thread::available_parallelism()
         .map_or(1, |val| val.get())
         .min(max_threads);
+    crate::fork::trace_point("parallelism_probe_done");
     let chunk_size = items.len().div_ceil(max_threads).max(min_items_per_thread);
 
     let mut chunks = items.chunks(chunk_size);
@@ -752,12 +767,18 @@ fn parallel_map<T: Sync, R: Send, E: Send>(
             .map(|chunk| scope.spawn(|| chunk.iter().map(&f).collect::<Vec<_>>()))
             .collect::<Vec<_>>();
 
+        crate::fork::trace_point("cpu_workers_spawned");
+        // Run this thread's chunk while the other workers are active. Joining
+        // first would serialize the last chunk behind all worker chunks.
+        let host_results = host_chunk.iter().map(&f).collect::<Vec<_>>();
+        crate::fork::trace_point("cpu_host_chunk_done");
         let mut results = Vec::with_capacity(items.len());
         for handle in handles {
             results.extend(handle.join().unwrap());
         }
 
-        results.extend(host_chunk.iter().map(&f));
+        crate::fork::trace_point("cpu_workers_joined");
+        results.extend(host_results);
         results.into_iter().collect()
     })
 }
@@ -1178,11 +1199,13 @@ impl CpuManager {
             return Err(Error::DesiredVCpuCountExceedsMax);
         }
 
+        crate::fork::trace_point("vcpu_handles_begin");
         // Only create vCPUs in excess of all the allocated vCPUs.
         for cpu_id in self.vcpus.len() as u32..desired_vcpus {
             vcpus.push(self.create_vcpu(cpu_id)?);
         }
 
+        crate::fork::trace_point("vcpu_handles_ready");
         if let Some(snapshot) = snapshot {
             parallel_map(
                 &vcpus,
@@ -3601,6 +3624,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_parallel_map_host_chunk_overlaps_worker() {
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+            return;
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let receive = std::sync::Mutex::new(receive);
+        let result = parallel_map(
+            &[0, 1],
+            |&item| -> std::result::Result<_, &'static str> {
+                if item == 0 {
+                    receive
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .map_err(|_| "host chunk was serialized behind worker")?;
+                } else {
+                    send.send(()).unwrap();
+                }
+                Ok(item)
+            },
+            2,
+            1,
+        );
+        assert_eq!(result.unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_parallel_map_single_chunk_preserves_errors_and_order() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = parallel_map(
+            &[0, 1, 2],
+            |&i| {
+                assert_eq!(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst), i);
+                if i == 1 { Err(i) } else { Ok(i) }
+            },
+            32,
+            4,
+        );
+        assert_eq!(result, Err(1));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

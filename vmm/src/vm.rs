@@ -602,7 +602,10 @@ impl Vm {
         self.vm.supports_fork_reuse().then(|| Arc::clone(&self.vm))
     }
     pub(crate) fn detach_fork_events(&self, parallel: bool) -> std::io::Result<()> {
-        self.device_manager.lock().unwrap().detach_fork_events(parallel)
+        self.device_manager
+            .lock()
+            .unwrap()
+            .detach_fork_events(parallel)
     }
 
     pub(crate) fn retain_fork_disks(&self) -> Vec<Box<dyn block::disk_file::ForkRetirement>> {
@@ -1041,6 +1044,7 @@ impl Vm {
             .unwrap()
             .allocate_address_space()
             .map_err(Error::MemoryManager)?;
+        crate::fork::trace_point("ram_slots_registered");
 
         // Load payload asynchronously
         let load_payload_handle = if snapshot.is_none() {

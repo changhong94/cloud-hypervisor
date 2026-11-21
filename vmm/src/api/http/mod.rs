@@ -354,7 +354,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         endpoint!("/vm.fork-status"),
         Box::new(VmActionHandler::new(&VmForkStatus)),
     );
-    r.routes.insert(endpoint!("/vm.fork-prepare"), Box::new(VmActionHandler::new(&VmForkPrepare)));
+    r.routes.insert(
+        endpoint!("/vm.fork-prepare"),
+        Box::new(VmActionHandler::new(&VmForkPrepare)),
+    );
     r.routes.insert(
         endpoint!("/vm.fork"),
         Box::new(VmActionHandler::new(&VmFork)),

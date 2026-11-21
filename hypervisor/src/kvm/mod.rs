@@ -1745,14 +1745,17 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     /// let vm = hypervisor.create_vm(HypervisorVmConfig::default()).unwrap();
     /// ```
     fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn vm::Vm>> {
-        let timing = std::env::var_os("CH_FORK_TIMING")
-            .map(|_| std::time::Instant::now());
+        let timing = std::env::var_os("CH_FORK_TIMING").map(|_| std::time::Instant::now());
         let mark = |phase: &str| {
             if let Some(started) = timing {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr().lock(),
+                let _ = writeln!(
+                    std::io::stderr().lock(),
                     "VM_KVM_INIT pid={} phase={} elapsed_ms={:.6}",
-                    std::process::id(), phase, started.elapsed().as_secs_f64() * 1000.0);
+                    std::process::id(),
+                    phase,
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
             }
         };
         let fd: VmFd;
