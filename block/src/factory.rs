@@ -9,7 +9,7 @@
 //! support, and constructs the appropriate backend. Callers receive
 //! a trait object that is ready for use by virtio queue workers.
 
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, FileTypeExt};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::{fs, io};
@@ -68,6 +68,14 @@ pub fn open_disk(
     options: &DiskOpenOptions<'_>,
     image_type: ImageType,
 ) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
+    if fs::symlink_metadata(options.path).map_err(|e| BlockError::new(BlockErrorKind::Io,e))?.file_type().is_socket() {
+        if image_type != ImageType::Raw || options.direct {
+            return Err(BlockError::new(BlockErrorKind::UnsupportedFeature, io::Error::other("native export requires raw buffered I/O")));
+        }
+        return crate::native_export::NativeDisk::open(options.path,options.readonly)
+            .map(|disk|Box::new(disk) as Box<dyn AsyncFullDiskFile>)
+            .map_err(|e|BlockError::new(BlockErrorKind::Io,e));
+    }
     let mut fs_options = fs::OpenOptions::new();
     fs_options.read(true);
     fs_options.write(!options.readonly);

@@ -1446,6 +1446,15 @@ fn fork_supervisor_rules(
     ] {
         add(virtio::get_seccomp_rules(role));
     }
+    // Only the fork supervisor creates ownership capabilities for its own
+    // unreaped children. Worker filters remain unchanged.
+    add(vec![
+        (libc::SYS_pidfd_open, or![and![Cond::new(1, ArgLen::Dword, Eq, 0)?]]),
+        (libc::SYS_dup3, or![
+            and![Cond::new(1, ArgLen::Dword, Eq, 1)?, Cond::new(2, ArgLen::Dword, Eq, 0)?],
+            and![Cond::new(1, ArgLen::Dword, Eq, 2)?, Cond::new(2, ArgLen::Dword, Eq, 0)?]
+        ]),
+    ]);
     // Only the calling supervisor may adjust scheduling around host fork.
     // Device/vCPU/VMM filters still reject these scheduling mutations.
     add(vec![

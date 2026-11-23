@@ -9,6 +9,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 pub mod disk_file;
+pub mod native_export;
 pub mod error;
 pub mod factory;
 #[path = "io/mod.rs"]

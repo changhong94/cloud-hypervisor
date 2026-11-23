@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Experimental same-host fork. Only immutable state and private RAM survive
-//! the teardown; no KVM object or worker is inherited by the new runtime.
+//! Experimental same-host fork. The parent retains its own KVM objects. The
+//! child closes inherited KVM descriptors and reconstructs its runtime from
+//! the device checkpoint and inherited private RAM, after joining host workers.
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -497,7 +498,6 @@ fn validate_config(c: &VmConfig) -> Result<(), Error> {
         || c.fs.is_some()
         || c.pmem.is_some()
         || c.generic_vhost_user.is_some()
-        || c.balloon.is_some()
         || c.tpm.is_some()
         || c.platform.is_some()
         || c.rate_limit_groups.is_some()
@@ -674,6 +674,11 @@ impl Vmm {
             VmOwnership::Migration { .. } => return Err(Error::VmMigrating),
             VmOwnership::None => return Err(Error::VmNotRunning),
         };
+        if request.native_child_disks.is_some() && vm.get_state() != VmState::Paused {
+            return Err(unsupported(
+                "Native disk branches require an already paused source",
+            ));
+        }
         vm.finish_incremental_restore_for_fork()?;
         if vm.restoring() {
             return Err(Error::VmRestoring);
@@ -699,14 +704,46 @@ impl Vmm {
         if let Some(directory) = &mut request.snapshot_directory {
             let metadata = fs::symlink_metadata(&*directory)
                 .map_err(|e| unsupported(&format!("Capture directory: {e}")))?;
-            if !directory.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
-                || fs::read_dir(&*directory).map_err(|e| unsupported(&e.to_string()))?.next().is_some()
+            if !directory.is_absolute()
+                || !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || fs::read_dir(&*directory)
+                    .map_err(|e| unsupported(&e.to_string()))?
+                    .next()
+                    .is_some()
             {
-                return Err(unsupported("Capture requires an empty absolute directory, without a symlink"));
+                return Err(unsupported(
+                    "Capture requires an empty absolute directory, without a symlink",
+                ));
             }
-            *directory = directory.canonicalize().map_err(|e| unsupported(&e.to_string()))?;
+            *directory = directory
+                .canonicalize()
+                .map_err(|e| unsupported(&e.to_string()))?;
             if request.child_vsock.is_some() || request.child_net.is_some() {
-                return Err(unsupported("Offline capture must not request a running child identity"));
+                return Err(unsupported(
+                    "Offline capture must not request a running child identity",
+                ));
+            }
+        }
+        if let Some(path) = &request.child_pidfd_socket {
+            use std::os::unix::fs::FileTypeExt;
+            if !path.is_absolute()
+                || request.native_child_disks.is_none()
+                || !fs::symlink_metadata(path)
+                    .map_err(|e| unsupported(&e.to_string()))?
+                    .file_type()
+                    .is_socket()
+            {
+                return Err(unsupported(
+                    "pidfd handoff requires a native disk fork and an existing absolute socket",
+                ));
+            }
+        }
+        if let Some(path) = &request.child_log_file {
+            if !path.is_absolute() || request.native_child_disks.is_none() || path.exists() {
+                return Err(unsupported(
+                    "child log must be a new absolute native fork path",
+                ));
             }
         }
         request.child_api_socket = new_socket_path(&request.child_api_socket)?;
@@ -774,9 +811,12 @@ impl Vmm {
                         .map_err(|_| unsupported("Invalid child network namespace"))?;
                     let current = fs::metadata("/proc/self/ns/net")
                         .map_err(|_| unsupported("Cannot inspect parent network namespace"))?;
-                    if target.ino() == current.ino() && target.dev() == current.dev() {
+                    if target.ino() == current.ino()
+                        && target.dev() == current.dev()
+                        && child.tap == parent[0].tap
+                    {
                         return Err(unsupported(
-                            "Child network namespace must differ from parent",
+                            "Child TAP must differ from parent in the same network namespace",
                         ));
                     }
                     // Preserve negotiated features and PCI/queue topology exactly.
@@ -795,6 +835,16 @@ impl Vmm {
                         "Fork requires matching parent and child network topology",
                     ));
                 }
+            }
+        }
+        if let Some(path) = &request.child_cgroup {
+            if !path.is_absolute()
+                || !path.join("cgroup.procs").exists()
+                || request.native_child_disks.is_none()
+            {
+                return Err(unsupported(
+                    "Native child requires a valid destination cgroup",
+                ));
             }
         }
         if let Some(job) = &self.disk_retirement {
@@ -1145,7 +1195,19 @@ impl ForkState {
             if let Some(prepared) = &mut prepared {
                 *self.prepared_opens.lock().unwrap() = std::mem::take(&mut prepared.opens);
             }
-            let disks = crate::fork_disk::commit(&mut self.config, prepared)?;
+            let mut disks = crate::fork_disk::commit(&mut self.config, prepared)?;
+            if let Some(paths) = &self.request.native_child_disks {
+                crate::fork_disk::validate(&self.config, &self.request)?;
+                let mut native = self
+                    .config
+                    .disks
+                    .clone()
+                    .ok_or_else(|| io::Error::other("native disks disappeared"))?;
+                for (disk, path) in native.iter_mut().zip(paths) {
+                    disk.path = Some(path.clone());
+                }
+                disks = Some(native);
+            }
             self.mark("disk_branched");
             for region in self.memory.iter() {
                 let start = region.as_ptr() as usize;
@@ -1190,7 +1252,8 @@ impl ForkState {
         a.set_read_timeout(Some(Duration::from_secs(30)))?;
         b.set_read_timeout(Some(Duration::from_secs(30)))?;
         // SAFETY: all application workers have been joined; the check above
-        // also rejects unexpected kernel/foreign workers. No KVM fd survives.
+        // also rejects unexpected kernel/foreign workers. The child closes
+        // inherited parent KVM descriptors before constructing its own VM.
         // Supported RAM is private and has no DMA/external writers. Thus no
         // lock is owned by a vanished thread and both processes may use Rust.
         self.mark("host_fork_begin");
@@ -1222,6 +1285,27 @@ impl ForkState {
             return Err(error);
         }
         if pid == 0 {
+            if let Some(path) = &self.request.child_cgroup {
+                fs::write(path.join("cgroup.procs"), process::id().to_string())?;
+            }
+
+            if let Some(path) = &self.request.child_log_file {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::OpenOptionsExt;
+                let log = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)?;
+                for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                    // SAFETY: log owns a live descriptor; this single-threaded
+                    // child owns its stdout/stderr and is about to replace them.
+                    if unsafe { libc::dup3(log.as_raw_fd(), target, 0) } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+            }
             // Only close inherited references: KvmVm/KvmVcpu destruction here
             // performs no ioctl. Old buses/events were detached BEFORE fork.
             // The child must never operate on a KVM owned by the parent's mm.
@@ -1240,7 +1324,10 @@ impl ForkState {
             let mut ready = [0];
             b.read_exact(&mut ready)?;
             if self.request.snapshot_directory.is_some() {
-                return Ok(ForkBranch { child: true, stream: b });
+                return Ok(ForkBranch {
+                    child: true,
+                    stream: b,
+                });
             }
             self.config.serial.common.socket = Some(self.request.child_serial_socket.clone());
             self.config.vsock = self.request.child_vsock.clone();
@@ -1321,6 +1408,33 @@ impl ForkState {
                 fork_log!("VM_FORK ram_shared_present_pages={pages} mismatched_pages=0");
             }
             self.mark("verification_done");
+            if let Some(path) = &self.request.child_pidfd_socket {
+                // The child is unreaped and held on a's gate, so pid cannot
+                // be recycled between fork and pidfd_open. The receiver owns
+                // an independent capability; it need never signal a raw PID.
+                use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+                use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+                // SAFETY: scalar syscall arguments; child_guard retains the
+                // unreaped child and therefore prevents PID reuse here.
+                let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                if raw < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: successful pidfd_open returned a new owned descriptor.
+                let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+                let mut socket = UnixStream::connect(path)?;
+                socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+                if socket.send_with_fd(&b"KPID0001"[..], fd.as_raw_fd())? != 8 {
+                    return Err(io::Error::other("short child pidfd handoff"));
+                }
+                let mut ack = [0];
+                socket.read_exact(&mut ack)?;
+                if ack != [1] {
+                    return Err(io::Error::other("child pidfd handoff rejected"));
+                }
+            }
             a.write_all(&[1])?;
             self.operation.child_pid = Some(pid as u32);
             self.operation.child_start_time = process_start_time(pid as u32);
@@ -1334,28 +1448,47 @@ impl ForkState {
 
     /// Runs only in the single-threaded CoW capture child, without a KVM VM.
     pub fn save_frozen_snapshot(&self) -> io::Result<()> {
-        let directory = self.request.snapshot_directory.as_ref()
+        let directory = self
+            .request
+            .snapshot_directory
+            .as_ref()
             .ok_or_else(|| io::Error::other("Missing capture directory"))?;
         let result = (|| {
             // Do not compete with parent runtime reconstruction for CPU and
             // page faults. Reuse the durability channel, without a new thread
             // or polling file. Parent loss/failure must not publish a snapshot.
-            let peer = self.retirement_peer.lock().unwrap().take()
+            let peer = self
+                .retirement_peer
+                .lock()
+                .unwrap()
+                .take()
                 .ok_or_else(|| io::Error::other("Missing capture retirement channel"))?;
             peer.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
             let mut bytes = Vec::new();
             peer.take(65536).read_to_end(&mut bytes)?;
-            let retired: Result<(), String> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            let retired: Result<(), String> =
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
             retired.map_err(io::Error::other)?;
             self.mark("capture_disk_durable");
-            let memory = self.snapshot.snapshots.get("memory-manager")
+            let memory = self
+                .snapshot
+                .snapshots
+                .get("memory-manager")
                 .ok_or_else(|| io::Error::other("Missing memory snapshot"))?;
-            let full_memory = crate::memory_manager::save_frozen_memory(memory, &self.memory, directory)?;
+            let full_memory =
+                crate::memory_manager::save_frozen_memory(memory, &self.memory, directory)?;
             let mut snapshot = self.snapshot.clone();
-            snapshot.snapshots.insert("memory-manager".into(), full_memory);
-            for (name, bytes) in [("config.json", serde_json::to_vec(&self.config)),
-                                  ("state.json", serde_json::to_vec(&snapshot))] {
-                let mut f = fs::OpenOptions::new().write(true).create_new(true).open(directory.join(name))?;
+            snapshot
+                .snapshots
+                .insert("memory-manager".into(), full_memory);
+            for (name, bytes) in [
+                ("config.json", serde_json::to_vec(&self.config)),
+                ("state.json", serde_json::to_vec(&snapshot)),
+            ] {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(directory.join(name))?;
                 f.write_all(&bytes.map_err(io::Error::other)?)?;
                 f.sync_all()?;
             }
@@ -1364,7 +1497,10 @@ impl ForkState {
         let status = serde_json::to_vec(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()))
             .map_err(io::Error::other)?;
         let temporary = directory.join("capture-status.pending");
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         f.write_all(&status)?;
         f.sync_all()?;
         fs::rename(temporary, directory.join("capture-status.json"))?;

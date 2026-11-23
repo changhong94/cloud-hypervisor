@@ -20,6 +20,7 @@ use std::os::unix::fs::FileExt;
 use std::{fmt, thread};
 
 use vm_migration::protocol::{MemoryRange, Request, Response, Status};
+use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::migration::transport::SocketStream;
 use crate::userfaultfd;
@@ -389,8 +390,16 @@ pub(crate) struct ManifestPageDescriptor {
     incremental: bool,
     #[serde(default)]
     baseline: Option<serde_json::Value>,
+    #[serde(default)]
+    read_window_bytes: u64,
+    #[serde(default)]
+    local_file_plan: bool,
 }
 pub(crate) struct ManifestUffdMemorySource {
+    local: Option<LocalSnapshotPages>,
+    read_window_bytes: u64,
+    cache_offset: u64,
+    cached_windows: std::collections::VecDeque<(u64, Vec<u8>)>,
     pub(crate) zero_ranges: Vec<(u64, u64)>,
     stream: std::os::unix::net::UnixStream,
     buf: Vec<u8>,
@@ -398,6 +407,11 @@ pub(crate) struct ManifestUffdMemorySource {
 impl ManifestUffdMemorySource {
     pub(crate) fn open(path: &std::path::Path, expected_size: u64) -> io::Result<Self> {
         let d: ManifestPageDescriptor = serde_json::from_reader(File::open(path)?)?;
+        if d.read_window_bytes != 0
+            && (!(4096..=65536).contains(&d.read_window_bytes) || d.read_window_bytes % 4096 != 0)
+        {
+            return Err(io::Error::other("Invalid Manifest read window"));
+        }
         if d.incremental && d.baseline.is_none() {
             return Err(io::Error::other("Missing incremental memory baseline"));
         }
@@ -434,10 +448,23 @@ impl ManifestUffdMemorySource {
             previous_end = start + len;
             zero_ranges.push((start, len));
         }
+        let local = if d.local_file_plan {
+            Some(LocalSnapshotPages::receive(
+                &mut stream,
+                expected_size,
+                &zero_ranges,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
+            local,
             stream,
             buf: Vec::new(),
             zero_ranges,
+            read_window_bytes: d.read_window_bytes,
+            cache_offset: 0,
+            cached_windows: std::collections::VecDeque::new(),
         })
     }
     pub(crate) fn shutdown_fd(&self) -> io::Result<OwnedFd> {
@@ -449,19 +476,226 @@ impl Drop for ManifestUffdMemorySource {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
+impl ManifestUffdMemorySource {
+    fn retain_window(&mut self) {
+        if !self.buf.is_empty() && self.buf.len() as u64 <= self.read_window_bytes {
+            // Including the current window, at most 32 windows (2 MiB with the maximum window size).
+            if self.cached_windows.len() == 31 {
+                self.cached_windows.pop_front();
+            }
+            self.cached_windows
+                .push_back((self.cache_offset, std::mem::take(&mut self.buf)));
+        } else {
+            self.buf.clear();
+        }
+    }
+    // Cache only immutable source bytes, never guest RAM. UFFDIO_COPY still
+    // installs just the faulted page and cannot overwrite an already live page.
+    fn read_page(&mut self, range: &UffdRange, page_idx: u64) -> io::Result<&[u8]> {
+        use std::io::Write;
+        if range.page_size > 2 * 1024 * 1024 || page_idx >= range.num_pages() {
+            return Err(io::Error::other("Unsupported Manifest page request"));
+        }
+        let offset = range.page_source_offset(page_idx);
+        if let Some(local) = &self.local {
+            self.buf.resize(range.page_size as usize, 0);
+            local.read(&mut self.buf, offset)?;
+            return Ok(&self.buf);
+        }
+        if offset >= self.cache_offset {
+            let start = offset - self.cache_offset;
+            if start <= self.buf.len() as u64 && range.page_size <= self.buf.len() as u64 - start {
+                return Ok(&self.buf[start as usize..(start + range.page_size) as usize]);
+            }
+        }
+        if let Some(index) = self.cached_windows.iter().position(|(start, bytes)| {
+            offset >= *start
+                && offset - *start <= bytes.len() as u64
+                && range.page_size <= bytes.len() as u64 - (offset - *start)
+        }) {
+            let (start, bytes) = self.cached_windows.remove(index).unwrap();
+            self.retain_window();
+            self.cache_offset = start;
+            self.buf = bytes;
+            let inner = (offset - start) as usize;
+            return Ok(&self.buf[inner..inner + range.page_size as usize]);
+        }
+        self.retain_window();
+        let window = range.page_size == 4096 && self.read_window_bytes >= range.page_size;
+        let count = if window {
+            self.read_window_bytes
+                .min(range.length - page_idx * range.page_size)
+        } else {
+            range.page_size
+        };
+        let mut request = [0; 16];
+        request[..8].copy_from_slice(&offset.to_le_bytes());
+        request[8..].copy_from_slice(&(count | if window { 1u64 << 63 } else { 0 }).to_le_bytes());
+        self.buf.clear(); // An I/O error must never leave a valid cache entry.
+        self.stream.write_all(&request)?;
+        let returned = if window {
+            let mut length = [0; 8];
+            self.stream.read_exact(&mut length)?;
+            u64::from_le_bytes(length)
+        } else {
+            count
+        };
+        if returned < range.page_size || returned > count || returned % range.page_size != 0 {
+            return Err(io::Error::other("Invalid Manifest returned window"));
+        }
+        let mut data = vec![0; returned as usize];
+        self.stream.read_exact(&mut data)?;
+        self.buf = data;
+        self.cache_offset = offset;
+        Ok(&self.buf[..range.page_size as usize])
+    }
+}
+
+// The fd pins the immutable plaintext snapshot inode. Packed offsets need not
+// be mmap-aligned: pread supplies only the faulted page, UFFD installs private
+// RAM, and writes remain ordinary guest CoW writes. No RAM fd crosses processes.
+struct LocalSnapshotPages {
+    files: Vec<File>,
+    size: u64,
+    extents: Vec<(u64, u64, u64, usize)>,
+}
+impl LocalSnapshotPages {
+    fn receive(
+        stream: &mut std::os::unix::net::UnixStream,
+        size: u64,
+        zeros: &[(u64, u64)],
+    ) -> io::Result<Self> {
+        let mut marker = [0];
+        let (n, file) = stream.recv_with_fd(&mut marker)?;
+        let file = file.ok_or_else(|| io::Error::other("Missing local snapshot fd"))?;
+        if n != 1 || (marker != [1] && marker != [2]) {
+            return Err(io::Error::other("Invalid local snapshot handoff"));
+        }
+        let multiple = marker == [2];
+        let mut files = vec![file];
+        if multiple {
+            let mut count = [0; 8];
+            stream.read_exact(&mut count)?;
+            let count = u64::from_le_bytes(count);
+            if !(2..=64).contains(&count) {
+                return Err(io::Error::other("Invalid local snapshot file count"));
+            }
+            for _ in 1..count {
+                let (n, file) = stream.recv_with_fd(&mut marker)?;
+                let file = file.ok_or_else(|| io::Error::other("Missing local snapshot fd"))?;
+                if n != 1 || marker != [1] {
+                    return Err(io::Error::other("Invalid local snapshot file marker"));
+                }
+                files.push(file);
+            }
+        }
+        let mut sizes = Vec::new();
+        for file in &files {
+            // SAFETY: file owns a live descriptor; fcntl only inspects/sets fd flags.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: same owned descriptor; no other owner can close/reuse it here.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let info = file.metadata()?;
+            if flags & libc::O_ACCMODE != libc::O_RDONLY || !info.is_file() {
+                return Err(io::Error::other(
+                    "Local snapshot fd must be a read-only regular file",
+                ));
+            }
+            sizes.push(info.len());
+        }
+        let mut word = [0; 8];
+        stream.read_exact(&mut word)?;
+        let count = u64::from_le_bytes(word);
+        if count == 0 || count > 1 << 20 {
+            return Err(io::Error::other("Invalid local snapshot extent count"));
+        }
+        let mut extents = Vec::new();
+        let mut end = 0;
+        for _ in 0..count {
+            let mut wire = [0; 24];
+            stream.read_exact(&mut wire)?;
+            let start = u64::from_le_bytes(wire[..8].try_into().unwrap());
+            let length = u64::from_le_bytes(wire[8..16].try_into().unwrap());
+            let physical = u64::from_le_bytes(wire[16..].try_into().unwrap());
+            let index = if multiple {
+                stream.read_exact(&mut word)?;
+                u64::from_le_bytes(word)
+            } else {
+                0
+            };
+            if index >= files.len() as u64 {
+                return Err(io::Error::other("Invalid local snapshot file index"));
+            }
+            let file_size = sizes[index as usize];
+            if start < end
+                || start > size
+                || length == 0
+                || length > size - start
+                || physical > file_size
+                || length > file_size - physical
+            {
+                return Err(io::Error::other("Invalid local snapshot extent"));
+            }
+            end = start + length;
+            extents.push((start, length, physical, index as usize));
+        }
+        let mut coverage: Vec<_> = extents
+            .iter()
+            .map(|(o, n, _, _)| (*o, *n))
+            .chain(zeros.iter().copied())
+            .collect();
+        coverage.sort_unstable();
+        let mut end = 0;
+        for (start, length) in coverage {
+            if start != end {
+                return Err(io::Error::other(
+                    "Local snapshot coverage overlaps or has gaps",
+                ));
+            }
+            end = start + length;
+        }
+        if end != size {
+            return Err(io::Error::other("Incomplete local snapshot coverage"));
+        }
+        Ok(Self {
+            files,
+            size,
+            extents,
+        })
+    }
+    fn read(&self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+        if offset > self.size || buffer.len() as u64 > self.size - offset {
+            return Err(io::Error::other("Local snapshot read outside RAM"));
+        }
+        buffer.fill(0);
+        let end = offset + buffer.len() as u64;
+        let first = self
+            .extents
+            .partition_point(|(start, length, _, _)| start + length <= offset);
+        for &(start, length, physical, index) in &self.extents[first..] {
+            if start >= end {
+                break;
+            }
+            let lo = start.max(offset);
+            let hi = (start + length).min(end);
+            self.files[index].read_exact_at(
+                &mut buffer[(lo - offset) as usize..(hi - offset) as usize],
+                physical + lo - start,
+            )?;
+        }
+        Ok(())
+    }
+}
 impl UffdMemorySource for ManifestUffdMemorySource {
     fn resolve(&mut self, fd: BorrowedFd<'_>, range: &UffdRange, page_idx: u64) -> io::Result<()> {
-        use std::io::Write;
-        if range.page_size > 2 * 1024 * 1024 {
-            return Err(io::Error::other("Unsupported Manifest page size"));
-        }
-        self.stream
-            .write_all(&range.page_source_offset(page_idx).to_le_bytes())?;
-        self.stream.write_all(&range.page_size.to_le_bytes())?;
-        self.buf.resize(range.page_size as usize, 0);
-        self.stream.read_exact(&mut self.buf)?;
+        let data = self.read_page(range, page_idx)?;
         let addr = range.page_addr(page_idx);
-        match copy(fd, addr, self.buf.as_ptr(), range.page_size) {
+        match copy(fd, addr, data.as_ptr(), range.page_size) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => wake(fd, addr, range.page_size),
             Err(e) => Err(e),
@@ -649,6 +883,75 @@ mod manifest_tests {
     use super::*;
 
     #[test]
+    fn manifest_local_file_handoff_checks_coverage_and_reads_unaligned_bytes() {
+        for (physical, zero_start, valid) in [
+            (3_u64, 4096_u64, true),
+            (8192, 4096, false),
+            (3, 2048, false),
+        ] {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.as_file().write_all_at(&vec![0x67; 8192], 0).unwrap();
+            let file = File::open(tmp.path()).unwrap();
+            let (mut server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let sender = thread::spawn(move || {
+                assert_eq!(
+                    server.send_with_fd(&[1u8][..], file.as_raw_fd()).unwrap(),
+                    1
+                );
+                for n in [1_u64, 0, 4096, physical] {
+                    server.write_all(&n.to_le_bytes()).unwrap();
+                }
+            });
+            let source = LocalSnapshotPages::receive(&mut client, 8192, &[(zero_start, 4096)]);
+            sender.join().unwrap();
+            assert_eq!(source.is_ok(), valid);
+            if let Ok(source) = source {
+                let mut bytes = vec![0xff; 8192];
+                source.read(&mut bytes, 0).unwrap();
+                assert!(bytes[..4096].iter().all(|b| *b == 0x67));
+                assert!(bytes[4096..].iter().all(|b| *b == 0));
+                assert!(source.read(&mut bytes, 1).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_multi_file_handoff_validates_file_indices_and_permissions() {
+        for (index, writable, valid) in [(1_u64, false, true), (2, false, false), (1, true, false)]
+        {
+            let first = tempfile::NamedTempFile::new().unwrap();
+            let second = tempfile::NamedTempFile::new().unwrap();
+            first.as_file().write_all_at(&vec![0x67; 8192], 0).unwrap();
+            second.as_file().write_all_at(&vec![0x89; 8192], 0).unwrap();
+            let a = File::open(first.path()).unwrap();
+            let b = OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .open(second.path())
+                .unwrap();
+            let (mut server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let sender = thread::spawn(move || {
+                server.send_with_fd(&[2u8][..], a.as_raw_fd()).unwrap();
+                server.write_all(&2_u64.to_le_bytes()).unwrap();
+                server.send_with_fd(&[1u8][..], b.as_raw_fd()).unwrap();
+                for value in [2_u64, 0, 4096, 3, 0, 4096, 4096, 7, index] {
+                    server.write_all(&value.to_le_bytes()).unwrap();
+                }
+            });
+            let source = LocalSnapshotPages::receive(&mut client, 12288, &[(8192, 4096)]);
+            sender.join().unwrap();
+            assert_eq!(source.is_ok(), valid);
+            if let Ok(source) = source {
+                let mut bytes = vec![0xff; 12288];
+                source.read(&mut bytes, 0).unwrap();
+                assert!(bytes[..4096].iter().all(|b| *b == 0x67));
+                assert!(bytes[4096..8192].iter().all(|b| *b == 0x89));
+                assert!(bytes[8192..].iter().all(|b| *b == 0));
+            }
+        }
+    }
+
+    #[test]
     fn manifest_source_checks_size_and_sparse_bounds() {
         for (size, offset, length, valid) in [
             (8192_u64, 4096_u64, 4096_u64, true),
@@ -682,5 +985,45 @@ mod manifest_tests {
             drop(result);
             server.join().unwrap();
         }
+    }
+    #[test]
+    fn manifest_window_caches_source_and_clips_to_range() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            for (off, count) in [(0u64, 8192u64), (8192, 4096)] {
+                let mut req = [0; 16];
+                server.read_exact(&mut req).unwrap();
+                assert_eq!(u64::from_le_bytes(req[..8].try_into().unwrap()), off);
+                assert_eq!(
+                    u64::from_le_bytes(req[8..].try_into().unwrap()),
+                    count | 1u64 << 63
+                );
+                server.write_all(&count.to_le_bytes()).unwrap();
+                server
+                    .write_all(&vec![if off == 0 { 7 } else { 9 }; count as usize])
+                    .unwrap();
+            }
+        });
+        let mut source = ManifestUffdMemorySource {
+            local: None,
+            zero_ranges: Vec::new(),
+            stream: client,
+            buf: Vec::new(),
+            cache_offset: 0,
+            cached_windows: std::collections::VecDeque::new(),
+            read_window_bytes: 8192,
+        };
+        let range = UffdRange {
+            host_addr: 0,
+            length: 12288,
+            source_offset: 0,
+            page_size: 4096,
+        };
+        assert_eq!(source.read_page(&range, 0).unwrap(), &[7; 4096]);
+        assert_eq!(source.read_page(&range, 1).unwrap(), &[7; 4096]);
+        assert_eq!(source.read_page(&range, 2).unwrap(), &[9; 4096]);
+        assert_eq!(source.read_page(&range, 1).unwrap(), &[7; 4096]);
+        assert!(source.read_page(&range, 3).is_err());
+        worker.join().unwrap();
     }
 }

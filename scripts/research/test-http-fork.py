@@ -132,6 +132,11 @@ with (out / 'disabled.log').open('w') as log:
 
 
 def resources(pid):
+    descriptors = {}
+    for fd in Path(f'/proc/{pid}/fd').iterdir():
+        try: descriptors[fd.name] = os.readlink(fd)
+        except FileNotFoundError: pass
+    (out / f'fds-{pid}-{time.monotonic_ns()}.json').write_text(json.dumps(descriptors, indent=2))
     roles = {}
     for task in Path(f'/proc/{pid}/task').iterdir():
         status = dict(line.split(':', 1) for line in (task / 'status').read_text().splitlines() if ':' in line)
@@ -155,7 +160,7 @@ with (out / 'vmm.log').open('w') as log:
             'memory': {'size': 256 * 1024 * 1024, 'shared': False, 'thp': False},
             'payload': {'kernel': kernel, 'initramfs': initramfs,
                         'cmdline': 'console=ttyS0 panic=-1 rdinit=/init'},
-            'disks': [{'path': str(disk), 'readonly': True, 'image_type': 'Raw'}],
+            'disks': [{'path': os.environ.get('NATIVE_DISK_SOCKET', str(disk)), 'readonly': True, 'image_type': 'Raw'}],
             'serial': {'mode': 'Socket', 'socket': str(parent_serial)},
             'console': {'mode': 'Off'},
         }
@@ -174,6 +179,7 @@ with (out / 'vmm.log').open('w') as log:
         api(parent_api, 'vm.fork', {'child_api_socket': str(child_api),
                                   'child_serial_socket': str(child_serial), 'unexpected': True}, expected=400)
         assert api(parent_api, 'vm.info', method='GET', expected=200)['state'] == 'Running'
+        first_request_start = time.monotonic()
         accepted = api(parent_api, 'vm.fork', {'child_api_socket': str(child_api),
                                   'child_serial_socket': str(child_serial)}, expected=200)
         first_op = wait_operation(parent_api, accepted['operation_id'])
@@ -201,6 +207,7 @@ with (out / 'vmm.log').open('w') as log:
         api(child_api, 'vm.resume')
         child.sock.sendall(b'30\n')
         child.wait('FORK_RESULT initial=10 value=30')
+        first_request_to_child_result_ms = (time.monotonic()-first_request_start)*1000
         assert 'FORK_DISK_OK value=30' in child.text
         parent.wait('FORK_ALIVE value=20', fresh=True)
         child.wait('FORK_ALIVE value=30', fresh=True)
@@ -341,7 +348,7 @@ with (out / 'vmm.log').open('w') as log:
         assert len(all_boundaries) == 14, all_boundaries
         assert all(abs(int(combined) - int(baseline)) <= 16 for combined, baseline in all_boundaries)
         assert not list(out.rglob('memory.img'))
-        result = {'parent_pid': proc.pid, 'child_pid': child_pid,
+        result = {'native_disk_export': bool(os.environ.get('NATIVE_DISK_SOCKET')), 'request_to_child_result_ms': first_request_to_child_result_ms, 'parent_pid': proc.pid, 'child_pid': child_pid,
                   'fork_baseline_pss_kib': baseline, 'fork_combined_pss_kib': combined,
                   'running_parent_pss_kib': parent_pss, 'running_child_pss_kib': child_pss,
                   'grandchild_pid': grand_pid, 'operations': [first_op, second_op],

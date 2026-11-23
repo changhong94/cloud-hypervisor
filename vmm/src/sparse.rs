@@ -13,6 +13,92 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
 
+// Only use in the single-threaded frozen capture child, after all UFFD
+// registrations have been resolved/removed and no KVM VM can write this RAM.
+// A non-present, non-swapped, unmarked PTE in a truly anonymous private VMA
+// denotes demand-zero memory. File-backed nonresident pages are NOT zero.
+// Inspect actual VMAs: GuestRegion flags can predate a MAP_FIXED restore.
+pub(crate) fn frozen_anonymous_read_ranges(
+    address: u64,
+    length: u64,
+) -> io::Result<Option<Vec<(u64, u64)>>> {
+    if vm_allocator::page_size::get_page_size() != 4096 || address % 4096 != 0 || length % 4096 != 0
+    {
+        return Ok(None);
+    }
+    let Some(end) = address.checked_add(length) else {
+        return Ok(None);
+    };
+    if !anonymous_private_coverage(&std::fs::read_to_string("/proc/self/maps")?, address, end) {
+        return Ok(None);
+    }
+    let pagemap = File::open("/proc/self/pagemap")?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut page = 0;
+    let pages = length / 4096;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    while page < pages {
+        let count = (pages - page).min((buffer.len() / 8) as u64);
+        pagemap.read_exact_at(
+            &mut buffer[..count as usize * 8],
+            (address / 4096 + page) * 8,
+        )?;
+        for entry in buffer[..count as usize * 8].chunks_exact(8) {
+            let entry = u64::from_ne_bytes(entry.try_into().unwrap());
+            // Soft-dirty is allowed on a never-faulted mapping. Every other
+            // flag (including swapped, present, guard or UFFD markers) forces
+            // the normal read, irrespective of masked/unavailable PFNs.
+            if entry & !(1 << 55) != 0 {
+                let offset = page * 4096;
+                if let Some(last) = ranges.last_mut()
+                    && last.0 + last.1 == offset
+                {
+                    last.1 += 4096;
+                } else {
+                    if ranges.len() == 1 << 20 {
+                        return Ok(None);
+                    }
+                    ranges.push((offset, 4096));
+                }
+            }
+            page += 1;
+        }
+    }
+    Ok(Some(ranges))
+}
+
+fn anonymous_private_coverage(maps: &str, start: u64, end: u64) -> bool {
+    let mut cursor = start;
+    for line in maps.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            return false;
+        }
+        let Some((lo, hi)) = fields[0].split_once('-') else {
+            return false;
+        };
+        let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else {
+            return false;
+        };
+        if hi <= cursor {
+            continue;
+        }
+        if lo > cursor
+            || fields.len() != 5
+            || fields[1] != "rw-p"
+            || fields[3] != "00:00"
+            || fields[4] != "0"
+        {
+            return false;
+        }
+        cursor = hi.min(end);
+        if cursor == end {
+            return true;
+        }
+    }
+    false
+}
+
 /// Snapshot a quiesced memory range into a newly created, zero-filled file.
 /// Read actual guest bytes, not the mapping's backing file: private CoW pages
 /// (including pages overwritten with zeroes) need not match that file.
@@ -21,9 +107,25 @@ pub fn write_memory_sparse(
     destination: &File,
     destination_offset: u64,
     length: u64,
-    mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+    read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
 ) -> io::Result<u64> {
     let mut buffer = vec![0; 1024 * 1024];
+    write_memory_sparse_buffered(destination, destination_offset, length, &mut buffer, read)
+}
+
+// Capture can contain many disjoint resident ranges. Reuse one bounded scratch
+// allocation for all of them rather than zero-initializing 1 MiB per range.
+pub(crate) fn write_memory_sparse_buffered(
+    destination: &File,
+    destination_offset: u64,
+    length: u64,
+    buffer: &mut [u8],
+    mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    if buffer.is_empty() || buffer.len() % 4096 != 0 {
+        return Err(io::Error::other("Invalid sparse capture scratch size"));
+    }
+    const ZERO_PAGE: [u8; 4096] = [0; 4096];
     let mut offset = 0;
     let mut written = 0;
     while offset < length {
@@ -32,7 +134,9 @@ pub fn write_memory_sparse(
         let mut run = None;
         for (index, page) in buffer[..count].chunks(4096).enumerate() {
             let start = index * 4096;
-            if page.iter().any(|byte| *byte != 0) {
+            // Slice equality uses the optimized byte comparison routine instead
+            // of a scalar early-exit loop over every byte of empty RAM.
+            if page != &ZERO_PAGE[..page.len()] {
                 run.get_or_insert(start);
             } else if let Some(begin) = run.take() {
                 destination.write_all_at(
@@ -50,6 +154,27 @@ pub fn write_memory_sparse(
             written += (count - begin) as u64;
         }
         offset += count as u64;
+    }
+    Ok(written)
+}
+
+// The caller owns a stable frozen view. The sparse output retains zero-page holes.
+pub(crate) fn write_frozen_bytes(destination: &File, offset: u64, bytes: &[u8]) -> io::Result<u64> {
+    const ZERO_PAGE: [u8; 4096] = [0; 4096];
+    let mut run = None;
+    let mut written = 0;
+    for (index, page) in bytes.chunks(4096).enumerate() {
+        let start = index * 4096;
+        if page != &ZERO_PAGE[..page.len()] {
+            run.get_or_insert(start);
+        } else if let Some(begin) = run.take() {
+            destination.write_all_at(&bytes[begin..start], offset + begin as u64)?;
+            written += (start - begin) as u64;
+        }
+    }
+    if let Some(begin) = run {
+        destination.write_all_at(&bytes[begin..], offset + begin as u64)?;
+        written += (bytes.len() - begin) as u64;
     }
     Ok(written)
 }
@@ -191,6 +316,62 @@ pub fn copy_region(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anonymous_capture_rejects_file_shared_and_gapped_mappings() {
+        use super::anonymous_private_coverage as covered;
+        assert!(covered("1000-4000 rw-p 00000000 00:00 0", 0x1000, 0x4000));
+        for maps in [
+            "1000-4000 rw-p 00000000 08:01 7 /tmp/snapshot",
+            "1000-4000 rw-s 00000000 00:00 0",
+            "2000-4000 rw-p 00000000 00:00 0",
+            "1000-4000 rw-p 00000000 00:00 0 [anon:unknown]",
+        ] {
+            assert!(!covered(maps, 0x1000, 0x4000), "{maps}");
+        }
+    }
+
+    #[test]
+    fn anonymous_capture_reads_present_pages_but_not_untouched_zeroes() {
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+        if vm_allocator::page_size::get_page_size() != 4096 {
+            return;
+        }
+        let memory = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 3 * 4096)]).unwrap();
+        memory.write_obj(0xabu8, GuestAddress(4096)).unwrap();
+        let address = memory.get_host_address(GuestAddress(0)).unwrap() as u64;
+        let ranges = super::frozen_anonymous_read_ranges(address, 3 * 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranges, vec![(4096, 4096)]);
+        // An overwritten zero page must also be read (its PTE remains present).
+        memory.write_obj(0u8, GuestAddress(4096)).unwrap();
+        assert_eq!(
+            super::frozen_anonymous_read_ranges(address, 3 * 4096)
+                .unwrap()
+                .unwrap(),
+            ranges
+        );
+    }
+
+    #[test]
+    fn anonymous_capture_never_skips_unfaulted_file_contents() {
+        use vm_memory::{FileOffset, MmapRegion};
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&[0x91; 4096], 0).unwrap();
+        let region = MmapRegion::<()>::build(
+            Some(FileOffset::new(file, 0)),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+        )
+        .unwrap();
+        assert!(
+            super::frozen_anonymous_read_ranges(region.as_ptr() as u64, 4096)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn private_memory_snapshot_preserves_zeroes_boundaries_and_errors() {
         use std::os::unix::fs::MetadataExt;
@@ -529,12 +710,18 @@ pub fn write_memory_delta_from_clone(
             if guest[start..end] != base[start..end] {
                 run.get_or_insert(start);
             } else if let Some(begin) = run.take() {
-                destination.write_all_at(&guest[begin..start], destination_offset + offset + begin as u64)?;
+                destination.write_all_at(
+                    &guest[begin..start],
+                    destination_offset + offset + begin as u64,
+                )?;
                 written += (start - begin) as u64;
             }
         }
         if let Some(begin) = run {
-            destination.write_all_at(&guest[begin..count], destination_offset + offset + begin as u64)?;
+            destination.write_all_at(
+                &guest[begin..count],
+                destination_offset + offset + begin as u64,
+            )?;
             written += (count - begin) as u64;
         }
         offset += count as u64;
@@ -556,17 +743,24 @@ mod clone_delta_tests {
         guest[..4096].fill(0);
         guest[8192..].fill(0x92);
         let written = write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o, b| {
-            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]); Ok(())
-        }).unwrap();
+            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(written, (8192 + 29) as u64);
         let mut actual = vec![0; guest.len()];
         output.read_exact_at(&mut actual, 0).unwrap();
         assert_eq!(actual, guest);
         base.read_exact_at(&mut actual, 0).unwrap();
         assert_eq!(actual, original);
-        assert_eq!(write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o,b| {
-            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]); Ok(())
-        }).unwrap(), 0);
+        assert_eq!(
+            write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o, b| {
+                b.copy_from_slice(&guest[o as usize..o as usize + b.len()]);
+                Ok(())
+            })
+            .unwrap(),
+            0
+        );
     }
     #[test]
     fn sparse_baseline_holes_and_data_match_frozen_memory() {
@@ -577,8 +771,10 @@ mod clone_delta_tests {
         guest[1024 * 1024 + 4096..1024 * 1024 + 8192].fill(7);
         guest[..4096].fill(5);
         let written = write_memory_delta_from_clone(&output, 0, guest.len() as u64, |o, b| {
-            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]); Ok(())
-        }).unwrap();
+            b.copy_from_slice(&guest[o as usize..o as usize + b.len()]);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(written, 4096);
         let mut actual = vec![0; guest.len()];
         output.read_exact_at(&mut actual, 0).unwrap();
@@ -588,6 +784,37 @@ mod clone_delta_tests {
     fn read_failure_is_not_reported_as_a_complete_snapshot() {
         let output = tempfile::tempfile().unwrap();
         output.set_len(4096).unwrap();
-        assert!(write_memory_delta_from_clone(&output, 0, 4096, |_,_| Err(io::Error::other("injected"))).is_err());
+        assert!(
+            write_memory_delta_from_clone(&output, 0, 4096, |_, _| Err(io::Error::other(
+                "injected"
+            )))
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod frozen_write_tests {
+    use super::*;
+    #[test]
+    fn direct_frozen_matches_buffered_with_zero_and_partial_pages() {
+        let mut data = vec![0u8; 4096 * 5 + 17];
+        data[..4096].fill(0x71);
+        data[8192..12288].fill(0x39);
+        data[20480..].fill(0xa3);
+        let direct = tempfile::tempfile().unwrap();
+        let buffered = tempfile::tempfile().unwrap();
+        direct.set_len(data.len() as u64).unwrap();
+        buffered.set_len(data.len() as u64).unwrap();
+        let a = write_frozen_bytes(&direct, 0, &data).unwrap();
+        let b = write_memory_sparse(&buffered, 0, data.len() as u64, |off, bytes| {
+            bytes.copy_from_slice(&data[off as usize..off as usize + bytes.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(a, b);
+        let mut actual = vec![0; data.len()];
+        direct.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
     }
 }

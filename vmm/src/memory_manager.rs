@@ -1475,9 +1475,9 @@ impl MemoryManager {
     // Host fork requires no outstanding UFFD owner. Populate before its existing
     // quiescence barrier; snapshots themselves do not take this path.
     pub fn finish_incremental_restore_for_fork(&mut self) -> io::Result<()> {
-        if self.incremental_memory.is_none() {
-            return Ok(());
-        }
+        // Both local and Manifest private restores can still own missing
+        // pages. Fork cannot inherit a missing-page registration without its
+        // servicing thread, irrespective of incremental snapshot metadata.
         if self.restoring() {
             let memory = self.guest_memory.memory();
             let mut page = vec![0; 4096];
@@ -1488,8 +1488,8 @@ impl MemoryManager {
                         .map_err(io::Error::other)?;
                 }
             }
-            self.stop_uffd_handler();
         }
+        self.stop_uffd_handler();
         Ok(())
     }
 
@@ -3997,8 +3997,11 @@ impl Transportable for MemoryManager {
         if sparse_layout && !cloned {
             // An unsuccessful filesystem clone must not leave stale extents
             // beneath zero pages skipped by the sparse fallback.
-            memory_file.set_len(0).and_then(|_| memory_file.set_len(total_len))
-                .context("Error resetting unshared snapshot").map_err(MigratableError::MigrateSend)?;
+            memory_file
+                .set_len(0)
+                .and_then(|_| memory_file.set_len(total_len))
+                .context("Error resetting unshared snapshot")
+                .map_err(MigratableError::MigrateSend)?;
         }
         let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
@@ -4008,13 +4011,27 @@ impl Transportable for MemoryManager {
             if cloned {
                 let started = time::Instant::now();
                 let written = crate::sparse::write_memory_delta_from_clone(
-                    &memory_file, file_cursor, range.length,
-                    |offset, bytes| guest_memory.read_slice(bytes, GuestAddress(range.gpa + offset)).map_err(io::Error::other),
-                ).context("Error patching reflinked snapshot").map_err(MigratableError::MigrateSend)?;
-                info!("SNAPSHOT_MEMORY_REFLINK logical_bytes={} written_bytes={} elapsed_us={}", range.length, written, started.elapsed().as_micros());
+                    &memory_file,
+                    file_cursor,
+                    range.length,
+                    |offset, bytes| {
+                        guest_memory
+                            .read_slice(bytes, GuestAddress(range.gpa + offset))
+                            .map_err(io::Error::other)
+                    },
+                )
+                .context("Error patching reflinked snapshot")
+                .map_err(MigratableError::MigrateSend)?;
+                info!(
+                    "SNAPSHOT_MEMORY_REFLINK logical_bytes={} written_bytes={} elapsed_us={}",
+                    range.length,
+                    written,
+                    started.elapsed().as_micros()
+                );
                 wrote_sparse = true;
             }
-            if !wrote_sparse && sparse_layout
+            if !wrote_sparse
+                && sparse_layout
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
                 && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
                 && let Some(file_offset) = region.file_offset()
@@ -4685,15 +4702,73 @@ pub(crate) fn save_frozen_memory(
         .open(directory.join(SNAPSHOT_FILENAME))?;
     f.set_len(data.memory_ranges.ranges().iter().map(|r| r.length).sum())?;
     let mut cursor = 0;
+    let mut read_time = time::Duration::ZERO;
+    let mut written_bytes = 0;
+    let mut read_bytes = 0;
+    let capture_start = time::Instant::now();
+    let mut scratch = vec![0; 1024 * 1024];
     for range in data.memory_ranges.ranges() {
-        write_memory_sparse(&f, cursor, range.length, |offset, bytes| {
-            memory
-                .read_slice(bytes, GuestAddress(range.gpa + offset))
-                .map_err(io::Error::other)
-        })?;
+        let address = memory
+            .get_host_address(GuestAddress(range.gpa))
+            .map_err(io::Error::other)? as u64;
+        let region = memory
+            .find_region(GuestAddress(range.gpa))
+            .ok_or_else(|| io::Error::other("Missing capture region"))?;
+        let ranges = if range
+            .gpa
+            .checked_add(range.length)
+            .is_some_and(|end| end <= region.start_addr().raw_value() + region.len())
+        {
+            crate::sparse::frozen_anonymous_read_ranges(address, range.length)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let single_region = range
+            .gpa
+            .checked_add(range.length)
+            .is_some_and(|end| end <= region.start_addr().raw_value() + region.len());
+        for (offset, length) in ranges.unwrap_or_else(|| vec![(0, range.length)]) {
+            if single_region {
+                // SAFETY: save_frozen_memory runs in the single-threaded fork
+                // capture child, without KVM or device writers. Its inherited
+                // RAM is CoW-isolated from the parent, all UFFD owners have been
+                // drained, and this checked span stays inside the live region.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts((address + offset) as *const u8, length as usize)
+                };
+                written_bytes += crate::sparse::write_frozen_bytes(&f, cursor + offset, bytes)?;
+                read_bytes += length as usize;
+                continue;
+            }
+            written_bytes += crate::sparse::write_memory_sparse_buffered(
+                &f,
+                cursor + offset,
+                length,
+                &mut scratch,
+                |inner, bytes| {
+                    let started = time::Instant::now();
+                    let result = memory
+                        .read_slice(bytes, GuestAddress(range.gpa + offset + inner))
+                        .map_err(io::Error::other);
+                    read_time += started.elapsed();
+                    read_bytes += bytes.len();
+                    result
+                },
+            )?;
+        }
         cursor += range.length;
     }
+    let capture_time = capture_start.elapsed();
+    let sync_start = time::Instant::now();
     f.sync_all()?;
+    eprintln!(
+        "FROZEN_MEMORY_CAPTURE logical_bytes={cursor} read_bytes={read_bytes} written_bytes={written_bytes} read_us={} scan_write_us={} sync_us={}",
+        read_time.as_micros(),
+        capture_time.saturating_sub(read_time).as_micros(),
+        sync_start.elapsed().as_micros()
+    );
     Snapshot::new_from_state(&data).map_err(io::Error::other)
 }
 

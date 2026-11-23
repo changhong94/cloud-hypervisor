@@ -2208,6 +2208,19 @@ impl ApiAction for VmShutdown {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmForkConfig {
+    /// Pinned host-owned destination cgroup; child joins before device workers.
+    #[serde(default)]
+    pub child_cgroup: Option<PathBuf>,
+    /// Independent child log, preventing inherited parent stdout pipe leases.
+    #[serde(default)]
+    pub child_log_file: Option<PathBuf>,
+    /// Trusted host listener receiving the child's pidfd from its OS parent.
+    #[serde(default)]
+    pub child_pidfd_socket: Option<PathBuf>,
+    /// Native disk owners prepare independent CoW branches while the VM is
+    /// paused. Paths cover every disk; immutable local disks cannot change.
+    #[serde(default)]
+    pub native_child_disks: Option<Vec<PathBuf>>,
     /// Capture inherited state without constructing or running a child VM.
     #[serde(default)]
     pub snapshot_directory: Option<PathBuf>,
