@@ -555,9 +555,9 @@ impl ManifestUffdMemorySource {
 // be mmap-aligned: pread supplies only the faulted page, UFFD installs private
 // RAM, and writes remain ordinary guest CoW writes. No RAM fd crosses processes.
 struct LocalSnapshotPages {
-    file: File,
+    files: Vec<File>,
     size: u64,
-    extents: Vec<(u64, u64, u64)>,
+    extents: Vec<(u64, u64, u64, usize)>,
 }
 impl LocalSnapshotPages {
     fn receive(
@@ -568,23 +568,45 @@ impl LocalSnapshotPages {
         let mut marker = [0];
         let (n, file) = stream.recv_with_fd(&mut marker)?;
         let file = file.ok_or_else(|| io::Error::other("Missing local snapshot fd"))?;
-        if n != 1 || marker != [1] {
+        if n != 1 || (marker != [1] && marker != [2]) {
             return Err(io::Error::other("Invalid local snapshot handoff"));
         }
-        // SAFETY: file owns a live descriptor; fcntl only inspects/sets fd flags.
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
+        let multiple = marker == [2];
+        let mut files = vec![file];
+        if multiple {
+            let mut count = [0; 8];
+            stream.read_exact(&mut count)?;
+            let count = u64::from_le_bytes(count);
+            if !(2..=64).contains(&count) {
+                return Err(io::Error::other("Invalid local snapshot file count"));
+            }
+            for _ in 1..count {
+                let (n, file) = stream.recv_with_fd(&mut marker)?;
+                let file = file.ok_or_else(|| io::Error::other("Missing local snapshot fd"))?;
+                if n != 1 || marker != [1] {
+                    return Err(io::Error::other("Invalid local snapshot file marker"));
+                }
+                files.push(file);
+            }
         }
-        // SAFETY: same owned descriptor; no other owner can close/reuse it here.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let info = file.metadata()?;
-        if flags & libc::O_ACCMODE != libc::O_RDONLY || !info.is_file() {
-            return Err(io::Error::other(
-                "Local snapshot fd must be a read-only regular file",
-            ));
+        let mut sizes = Vec::new();
+        for file in &files {
+            // SAFETY: file owns a live descriptor; fcntl only inspects/sets fd flags.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: same owned descriptor; no other owner can close/reuse it here.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let info = file.metadata()?;
+            if flags & libc::O_ACCMODE != libc::O_RDONLY || !info.is_file() {
+                return Err(io::Error::other(
+                    "Local snapshot fd must be a read-only regular file",
+                ));
+            }
+            sizes.push(info.len());
         }
         let mut word = [0; 8];
         stream.read_exact(&mut word)?;
@@ -600,21 +622,31 @@ impl LocalSnapshotPages {
             let start = u64::from_le_bytes(wire[..8].try_into().unwrap());
             let length = u64::from_le_bytes(wire[8..16].try_into().unwrap());
             let physical = u64::from_le_bytes(wire[16..].try_into().unwrap());
+            let index = if multiple {
+                stream.read_exact(&mut word)?;
+                u64::from_le_bytes(word)
+            } else {
+                0
+            };
+            if index >= files.len() as u64 {
+                return Err(io::Error::other("Invalid local snapshot file index"));
+            }
+            let file_size = sizes[index as usize];
             if start < end
                 || start > size
                 || length == 0
                 || length > size - start
-                || physical > info.len()
-                || length > info.len() - physical
+                || physical > file_size
+                || length > file_size - physical
             {
                 return Err(io::Error::other("Invalid local snapshot extent"));
             }
             end = start + length;
-            extents.push((start, length, physical));
+            extents.push((start, length, physical, index as usize));
         }
         let mut coverage: Vec<_> = extents
             .iter()
-            .map(|(o, n, _)| (*o, *n))
+            .map(|(o, n, _, _)| (*o, *n))
             .chain(zeros.iter().copied())
             .collect();
         coverage.sort_unstable();
@@ -631,7 +663,7 @@ impl LocalSnapshotPages {
             return Err(io::Error::other("Incomplete local snapshot coverage"));
         }
         Ok(Self {
-            file,
+            files,
             size,
             extents,
         })
@@ -644,14 +676,14 @@ impl LocalSnapshotPages {
         let end = offset + buffer.len() as u64;
         let first = self
             .extents
-            .partition_point(|(start, length, _)| start + length <= offset);
-        for &(start, length, physical) in &self.extents[first..] {
+            .partition_point(|(start, length, _, _)| start + length <= offset);
+        for &(start, length, physical, index) in &self.extents[first..] {
             if start >= end {
                 break;
             }
             let lo = start.max(offset);
             let hi = (start + length).min(end);
-            self.file.read_exact_at(
+            self.files[index].read_exact_at(
                 &mut buffer[(lo - offset) as usize..(hi - offset) as usize],
                 physical + lo - start,
             )?;
@@ -879,6 +911,42 @@ mod manifest_tests {
                 assert!(bytes[..4096].iter().all(|b| *b == 0x67));
                 assert!(bytes[4096..].iter().all(|b| *b == 0));
                 assert!(source.read(&mut bytes, 1).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_multi_file_handoff_validates_file_indices_and_permissions() {
+        for (index, writable, valid) in [(1_u64, false, true), (2, false, false), (1, true, false)]
+        {
+            let first = tempfile::NamedTempFile::new().unwrap();
+            let second = tempfile::NamedTempFile::new().unwrap();
+            first.as_file().write_all_at(&vec![0x67; 8192], 0).unwrap();
+            second.as_file().write_all_at(&vec![0x89; 8192], 0).unwrap();
+            let a = File::open(first.path()).unwrap();
+            let b = OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .open(second.path())
+                .unwrap();
+            let (mut server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let sender = thread::spawn(move || {
+                server.send_with_fd(&[2u8][..], a.as_raw_fd()).unwrap();
+                server.write_all(&2_u64.to_le_bytes()).unwrap();
+                server.send_with_fd(&[1u8][..], b.as_raw_fd()).unwrap();
+                for value in [2_u64, 0, 4096, 3, 0, 4096, 4096, 7, index] {
+                    server.write_all(&value.to_le_bytes()).unwrap();
+                }
+            });
+            let source = LocalSnapshotPages::receive(&mut client, 12288, &[(8192, 4096)]);
+            sender.join().unwrap();
+            assert_eq!(source.is_ok(), valid);
+            if let Ok(source) = source {
+                let mut bytes = vec![0xff; 12288];
+                source.read(&mut bytes, 0).unwrap();
+                assert!(bytes[..4096].iter().all(|b| *b == 0x67));
+                assert!(bytes[4096..8192].iter().all(|b| *b == 0x89));
+                assert!(bytes[8192..].iter().all(|b| *b == 0));
             }
         }
     }

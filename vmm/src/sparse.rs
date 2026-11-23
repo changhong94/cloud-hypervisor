@@ -15,10 +15,10 @@ use std::os::unix::fs::FileExt;
 
 // Only use in the single-threaded frozen capture child, after all UFFD
 // registrations have been resolved/removed and no KVM VM can write this RAM.
-// A non-present, non-swapped, unmarked PTE in a truly anonymous private VMA
-// denotes demand-zero memory. File-backed nonresident pages are NOT zero.
+// A non-present, non-swapped, unmarked PTE denotes zero only in an anonymous
+// mapping or an immutable file-backed hole. File-backed data is always read.
 // Inspect actual VMAs: GuestRegion flags can predate a MAP_FIXED restore.
-pub(crate) fn frozen_anonymous_read_ranges(
+pub(crate) fn frozen_private_read_ranges(
     address: u64,
     length: u64,
 ) -> io::Result<Option<Vec<(u64, u64)>>> {
@@ -29,9 +29,16 @@ pub(crate) fn frozen_anonymous_read_ranges(
     let Some(end) = address.checked_add(length) else {
         return Ok(None);
     };
-    if !anonymous_private_coverage(&std::fs::read_to_string("/proc/self/maps")?, address, end) {
-        return Ok(None);
-    }
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let backing = if anonymous_private_coverage(&maps, address, end) {
+        Vec::new()
+    } else {
+        let Some(ranges) = frozen_file_data_ranges(&maps, address, end)? else {
+            return Ok(None);
+        };
+        ranges
+    };
+    let mut backing_index = 0;
     let pagemap = File::open("/proc/self/pagemap")?;
     let mut buffer = [0u8; 64 * 1024];
     let mut page = 0;
@@ -48,8 +55,16 @@ pub(crate) fn frozen_anonymous_read_ranges(
             // Soft-dirty is allowed on a never-faulted mapping. Every other
             // flag (including swapped, present, guard or UFFD markers) forces
             // the normal read, irrespective of masked/unavailable PFNs.
-            if entry & !(1 << 55) != 0 {
-                let offset = page * 4096;
+            let offset = page * 4096;
+            while backing_index < backing.len()
+                && backing[backing_index].0 + backing[backing_index].1 <= offset
+            {
+                backing_index += 1;
+            }
+            let has_backing = backing
+                .get(backing_index)
+                .is_some_and(|&(start, len)| start < offset + 4096 && start + len > offset);
+            if entry & !(1 << 55) != 0 || has_backing {
                 if let Some(last) = ranges.last_mut()
                     && last.0 + last.1 == offset
                 {
@@ -65,6 +80,62 @@ pub(crate) fn frozen_anonymous_read_ranges(
         }
     }
     Ok(Some(ranges))
+}
+
+// File-backed private RAM can contain nonresident data, so residency alone is
+// never enough. The immutable restore backing is opened through map_files (not
+// its possibly renamed pathname). Skip only backing holes with no present,
+// swapped or marked PTE; every private CoW page is still read from guest RAM.
+fn frozen_file_data_ranges(
+    maps: &str,
+    start: u64,
+    end: u64,
+) -> io::Result<Option<Vec<(u64, u64)>>> {
+    for line in maps.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            return Ok(None);
+        }
+        let Some((lo, hi)) = fields[0].split_once('-') else {
+            return Ok(None);
+        };
+        let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else {
+            return Ok(None);
+        };
+        if hi <= start {
+            continue;
+        }
+        if lo > start || hi < end || fields[1] != "rw-p" || fields[4] == "0" {
+            return Ok(None);
+        }
+        let Ok(file_offset) = u64::from_str_radix(fields[2], 16) else {
+            return Ok(None);
+        };
+        let base = file_offset
+            .checked_add(start - lo)
+            .ok_or_else(|| io::Error::other("capture offset overflow"))?;
+        let limit = base
+            .checked_add(end - start)
+            .ok_or_else(|| io::Error::other("capture length overflow"))?;
+        let file = File::open(format!("/proc/self/map_files/{lo:x}-{hi:x}"))?;
+        if file.metadata()?.len() < limit {
+            return Ok(None);
+        }
+        let mut ranges = Vec::new();
+        let mut cursor = base;
+        while let Some((offset, length)) = next_data_extent(file.as_fd(), cursor, limit)? {
+            if length == 0 || offset < cursor {
+                return Ok(None);
+            }
+            if ranges.len() == 1 << 20 {
+                return Ok(None);
+            }
+            ranges.push((offset - base, length));
+            cursor = offset + length;
+        }
+        return Ok(Some(ranges));
+    }
+    Ok(None)
 }
 
 fn anonymous_private_coverage(maps: &str, start: u64, end: u64) -> bool {
@@ -107,10 +178,25 @@ pub fn write_memory_sparse(
     destination: &File,
     destination_offset: u64,
     length: u64,
+    read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut buffer = vec![0; 1024 * 1024];
+    write_memory_sparse_buffered(destination, destination_offset, length, &mut buffer, read)
+}
+
+// Capture can contain many disjoint resident ranges. Reuse one bounded scratch
+// allocation for all of them rather than zero-initializing 1 MiB per range.
+pub(crate) fn write_memory_sparse_buffered(
+    destination: &File,
+    destination_offset: u64,
+    length: u64,
+    buffer: &mut [u8],
     mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
 ) -> io::Result<u64> {
+    if buffer.is_empty() || buffer.len() % 4096 != 0 {
+        return Err(io::Error::other("Invalid sparse capture scratch size"));
+    }
     const ZERO_PAGE: [u8; 4096] = [0; 4096];
-    let mut buffer = vec![0; 1024 * 1024];
     let mut offset = 0;
     let mut written = 0;
     while offset < length {
@@ -139,6 +225,27 @@ pub fn write_memory_sparse(
             written += (count - begin) as u64;
         }
         offset += count as u64;
+    }
+    Ok(written)
+}
+
+// The caller owns a stable frozen view. The sparse output retains zero-page holes.
+pub(crate) fn write_frozen_bytes(destination: &File, offset: u64, bytes: &[u8]) -> io::Result<u64> {
+    const ZERO_PAGE: [u8; 4096] = [0; 4096];
+    let mut run = None;
+    let mut written = 0;
+    for (index, page) in bytes.chunks(4096).enumerate() {
+        let start = index * 4096;
+        if page != &ZERO_PAGE[..page.len()] {
+            run.get_or_insert(start);
+        } else if let Some(begin) = run.take() {
+            destination.write_all_at(&bytes[begin..start], offset + begin as u64)?;
+            written += (start - begin) as u64;
+        }
+    }
+    if let Some(begin) = run {
+        destination.write_all_at(&bytes[begin..], offset + begin as u64)?;
+        written += (bytes.len() - begin) as u64;
     }
     Ok(written)
 }
@@ -303,14 +410,14 @@ mod tests {
         let memory = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 3 * 4096)]).unwrap();
         memory.write_obj(0xabu8, GuestAddress(4096)).unwrap();
         let address = memory.get_host_address(GuestAddress(0)).unwrap() as u64;
-        let ranges = super::frozen_anonymous_read_ranges(address, 3 * 4096)
+        let ranges = super::frozen_private_read_ranges(address, 3 * 4096)
             .unwrap()
             .unwrap();
         assert_eq!(ranges, vec![(4096, 4096)]);
         // An overwritten zero page must also be read (its PTE remains present).
         memory.write_obj(0u8, GuestAddress(4096)).unwrap();
         assert_eq!(
-            super::frozen_anonymous_read_ranges(address, 3 * 4096)
+            super::frozen_private_read_ranges(address, 3 * 4096)
                 .unwrap()
                 .unwrap(),
             ranges
@@ -329,11 +436,59 @@ mod tests {
             libc::MAP_PRIVATE,
         )
         .unwrap();
-        assert!(
-            super::frozen_anonymous_read_ranges(region.as_ptr() as u64, 4096)
-                .unwrap()
-                .is_none()
+        if let Ok(Some(ranges)) = super::frozen_private_read_ranges(region.as_ptr() as u64, 4096) {
+            assert_eq!(ranges, vec![(0, 4096)]);
+        } // Unprivileged map_files access falls back to reading the whole VMA.
+    }
+
+    #[test]
+    fn file_capture_preserves_private_writes_and_unfaulted_data_without_reading_holes() {
+        use vm_memory::{
+            Bytes, FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestRegionMmap,
+            MmapRegion,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(16 * 4096).unwrap();
+        file.write_all_at(&[0x91; 4096], 3 * 4096).unwrap();
+        file.write_all_at(&[0x92; 4096], 9 * 4096).unwrap();
+        let region = MmapRegion::<()>::build(
+            Some(FileOffset::new(file, 0)),
+            16 * 4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+        )
+        .unwrap();
+        let memory = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+        memory.write_obj(0xabu8, GuestAddress(6 * 4096)).unwrap();
+        memory
+            .write_slice(&[0; 4096], GuestAddress(9 * 4096))
+            .unwrap();
+        let address = memory.get_host_address(GuestAddress(0)).unwrap() as u64;
+        let Ok(Some(ranges)) = super::frozen_private_read_ranges(address, 16 * 4096) else {
+            return;
+        };
+        assert_eq!(
+            ranges,
+            vec![(3 * 4096, 4096), (6 * 4096, 4096), (9 * 4096, 4096)]
         );
+        let output = tempfile::tempfile().unwrap();
+        output.set_len(16 * 4096).unwrap();
+        for (off, len) in ranges {
+            super::write_memory_sparse(&output, off, len, |i, b| {
+                memory
+                    .read_slice(b, GuestAddress(off + i))
+                    .map_err(std::io::Error::other)
+            })
+            .unwrap();
+        }
+        let mut restored = vec![0; 16 * 4096];
+        output.read_exact_at(&mut restored, 0).unwrap();
+        assert_eq!(restored[3 * 4096], 0x91);
+        assert_eq!(restored[6 * 4096], 0xab);
+        assert_eq!(restored[9 * 4096], 0);
     }
 
     #[test]
@@ -754,5 +909,31 @@ mod clone_delta_tests {
             )))
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod frozen_write_tests {
+    use super::*;
+    #[test]
+    fn direct_frozen_matches_buffered_with_zero_and_partial_pages() {
+        let mut data = vec![0u8; 4096 * 5 + 17];
+        data[..4096].fill(0x71);
+        data[8192..12288].fill(0x39);
+        data[20480..].fill(0xa3);
+        let direct = tempfile::tempfile().unwrap();
+        let buffered = tempfile::tempfile().unwrap();
+        direct.set_len(data.len() as u64).unwrap();
+        buffered.set_len(data.len() as u64).unwrap();
+        let a = write_frozen_bytes(&direct, 0, &data).unwrap();
+        let b = write_memory_sparse(&buffered, 0, data.len() as u64, |off, bytes| {
+            bytes.copy_from_slice(&data[off as usize..off as usize + bytes.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(a, b);
+        let mut actual = vec![0; data.len()];
+        direct.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, data);
     }
 }

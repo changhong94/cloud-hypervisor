@@ -4706,6 +4706,7 @@ pub(crate) fn save_frozen_memory(
     let mut written_bytes = 0;
     let mut read_bytes = 0;
     let capture_start = time::Instant::now();
+    let mut scratch = vec![0; 1024 * 1024];
     for range in data.memory_ranges.ranges() {
         let address = memory
             .get_host_address(GuestAddress(range.gpa))
@@ -4718,22 +4719,44 @@ pub(crate) fn save_frozen_memory(
             .checked_add(range.length)
             .is_some_and(|end| end <= region.start_addr().raw_value() + region.len())
         {
-            crate::sparse::frozen_anonymous_read_ranges(address, range.length)
+            crate::sparse::frozen_private_read_ranges(address, range.length)
                 .ok()
                 .flatten()
         } else {
             None
         };
+        let single_region = range
+            .gpa
+            .checked_add(range.length)
+            .is_some_and(|end| end <= region.start_addr().raw_value() + region.len());
         for (offset, length) in ranges.unwrap_or_else(|| vec![(0, range.length)]) {
-            written_bytes += write_memory_sparse(&f, cursor + offset, length, |inner, bytes| {
-                let started = time::Instant::now();
-                let result = memory
-                    .read_slice(bytes, GuestAddress(range.gpa + offset + inner))
-                    .map_err(io::Error::other);
-                read_time += started.elapsed();
-                read_bytes += bytes.len();
-                result
-            })?;
+            if single_region {
+                // SAFETY: save_frozen_memory runs in the single-threaded fork
+                // capture child, without KVM or device writers. Its inherited
+                // RAM is CoW-isolated from the parent, all UFFD owners have been
+                // drained, and this checked span stays inside the live region.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts((address + offset) as *const u8, length as usize)
+                };
+                written_bytes += crate::sparse::write_frozen_bytes(&f, cursor + offset, bytes)?;
+                read_bytes += length as usize;
+                continue;
+            }
+            written_bytes += crate::sparse::write_memory_sparse_buffered(
+                &f,
+                cursor + offset,
+                length,
+                &mut scratch,
+                |inner, bytes| {
+                    let started = time::Instant::now();
+                    let result = memory
+                        .read_slice(bytes, GuestAddress(range.gpa + offset + inner))
+                        .map_err(io::Error::other);
+                    read_time += started.elapsed();
+                    read_bytes += bytes.len();
+                    result
+                },
+            )?;
         }
         cursor += range.length;
     }
