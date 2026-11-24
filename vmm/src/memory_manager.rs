@@ -1098,19 +1098,23 @@ impl MemoryManager {
         let descriptor = file_path.with_extension("manifest.json");
         self.incremental_memory = None;
         let mut zero_ranges = Vec::new();
+        let mut local_missing = None;
         let (snapshot_file, source, shutdown_fd): (
             Option<File>,
             Box<dyn UffdMemorySource>,
             Option<OwnedFd>,
         ) = if descriptor.exists() {
+            let manifest_started = std::time::Instant::now();
             let source = crate::uffd::ManifestUffdMemorySource::open(
                 &descriptor,
                 saved_regions.ranges().iter().map(|r| r.length).sum(),
             )
             .map_err(Error::SnapshotOpen)?;
-            let d: serde_json::Value =
-                serde_json::from_reader(File::open(&descriptor).map_err(Error::SnapshotOpen)?)
-                    .map_err(|e| Error::SnapshotOpen(io::Error::other(e)))?;
+            let manifest_open_us = manifest_started.elapsed().as_micros();
+            let d: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
+                File::open(&descriptor).map_err(Error::SnapshotOpen)?,
+            ))
+            .map_err(|e| Error::SnapshotOpen(io::Error::other(e)))?;
             if d["incremental"].as_bool().unwrap_or(false) {
                 let base: MemoryBaseline = serde_json::from_value(d["baseline"].clone())
                     .map_err(|e| Error::SnapshotOpen(io::Error::other(e)))?;
@@ -1118,6 +1122,62 @@ impl MemoryManager {
                     base,
                     dirty: Default::default(),
                 });
+            }
+            // Only untouched private RAM may be overlaid. Shared/VFIO mappings
+            // and unaligned/encrypted/remote sources retain UFFD semantics.
+            let guest_memory = self.guest_memory.memory();
+            if is_restore_cow_compatible(&guest_memory, saved_regions)
+                && guest_memory
+                    .iter()
+                    .all(|r| r.flags() & libc::MAP_SHARED == 0)
+            {
+                let mut offset = 0;
+                let mut windows = Vec::new();
+                for range in saved_regions.ranges() {
+                    let host = guest_memory
+                        .get_host_address(GuestAddress(range.gpa))
+                        .map_err(|e| Error::SnapshotMmap(io::Error::other(e)))?;
+                    let region = guest_memory.find_region(GuestAddress(range.gpa)).unwrap();
+                    windows.push((
+                        offset,
+                        range.length,
+                        host as u64,
+                        region.flags() & libc::MAP_NORESERVE,
+                    ));
+                    offset += range.length;
+                }
+                // SAFETY: compatibility above proves fresh anonymous private
+                // windows; restore has not exposed them to a running vCPU.
+                let mapping_started = std::time::Instant::now();
+                if let Some(missing) =
+                    unsafe { source.map_local_cow(&windows) }.map_err(Error::SnapshotMmap)?
+                {
+                    let bytes: u64 = missing.iter().map(|(_, len)| *len).sum();
+                    eprintln!(
+                        "LOCAL_COW mapped_bytes={} uffd_bytes={bytes} manifest_open_us={manifest_open_us} mapping_us={}",
+                        offset - bytes,
+                        mapping_started.elapsed().as_micros()
+                    );
+                    if missing.is_empty() {
+                        return Ok(());
+                    }
+                    let mut table = MemoryRangeTable::default();
+                    let mut base = 0;
+                    for range in saved_regions.ranges() {
+                        for &(off, len) in &missing {
+                            let lo = base.max(off);
+                            let hi = (base + range.length).min(off + len);
+                            if hi > lo {
+                                table.push(MemoryRange {
+                                    gpa: range.gpa + lo - base,
+                                    length: hi - lo,
+                                });
+                            }
+                        }
+                        base += range.length;
+                    }
+                    local_missing = Some(table);
+                }
             }
             zero_ranges = source.zero_ranges.clone();
             let fd = source.shutdown_fd().map_err(Error::SnapshotOpen)?;
@@ -1129,8 +1189,18 @@ impl MemoryManager {
         };
 
         let Some(uffd) = self.prepare_uffd(
-            saved_regions,
+            local_missing.as_ref().unwrap_or(saved_regions),
             |r| {
+                if local_missing.is_some() {
+                    let mut base = 0;
+                    for original in saved_regions.ranges() {
+                        if r.gpa >= original.gpa && r.gpa < original.gpa + original.length {
+                            return base + r.gpa - original.gpa;
+                        }
+                        base += original.length;
+                    }
+                    unreachable!("local missing range must belong to a saved region");
+                }
                 let o = file_offset;
                 file_offset += r.length;
                 o

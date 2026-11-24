@@ -487,6 +487,12 @@ fn get_cli_options_sorted(
             .requires("enable-fork")
             .conflicts_with_all(["restore", "kernel", "firmware"])
             .group("vmm-config"),
+        Arg::new("restore-ready-fd")
+            .long("restore-ready-fd")
+            .help("Inherited FD: write byte 1 after startup restore reaches Paused")
+            .value_parser(clap::value_parser!(i32).range(3..))
+            .requires("restore")
+            .group("vmm-config"),
         Arg::new("prepare-ready-fd")
             .long("prepare-ready-fd")
             .help("Inherited socket FD: write byte 1 only after empty-slot preparation succeeds")
@@ -996,6 +1002,12 @@ fn start_vmm(
                     .send(api_evt.try_clone().unwrap(), sender, ())
                     .map_err(Error::VmBoot)?;
             } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
+                use std::io::Write;
+                // One-shot descriptor ownership ends before any later fork.
+                let mut ready = cmd_arguments
+                    .get_one::<i32>("restore-ready-fd")
+                    // SAFETY: the launcher exclusively transfers this inherited FD.
+                    .map(|fd| unsafe { File::from_raw_fd(*fd) });
                 api::VmRestore
                     .send(
                         api_evt.try_clone().unwrap(),
@@ -1003,6 +1015,11 @@ fn start_vmm(
                         RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?,
                     )
                     .map_err(Error::VmRestore)?;
+                if let Some(ready) = ready.as_mut() {
+                    ready.write_all(&[1]).map_err(|e| {
+                        Error::PrepareStartup(format!("restore acknowledgement: {e}"))
+                    })?;
+                }
             }
 
             Ok(())
@@ -2351,6 +2368,35 @@ mod tests {
         .for_each(|(cli, openapi, equal)| {
             compare_vm_config_cli_vs_json(cli, openapi, *equal);
         });
+    }
+
+    #[test]
+    fn test_restore_ack_cli_contract() {
+        let parse = |args: Vec<&str>| {
+            let (cpus, memory, rng) = prepare_default_values();
+            create_app(cpus, memory, rng).try_get_matches_from(args)
+        };
+        assert!(
+            parse(vec![
+                "cloud-hypervisor",
+                "--restore",
+                "source_url=file:///snapshot",
+                "--restore-ready-fd",
+                "4"
+            ])
+            .is_ok()
+        );
+        assert!(parse(vec!["cloud-hypervisor", "--restore-ready-fd", "4"]).is_err());
+        assert!(
+            parse(vec![
+                "cloud-hypervisor",
+                "--restore",
+                "source_url=file:///snapshot",
+                "--restore-ready-fd",
+                "1"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

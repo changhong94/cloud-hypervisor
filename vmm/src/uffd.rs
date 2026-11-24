@@ -406,7 +406,8 @@ pub(crate) struct ManifestUffdMemorySource {
 }
 impl ManifestUffdMemorySource {
     pub(crate) fn open(path: &std::path::Path, expected_size: u64) -> io::Result<Self> {
-        let d: ManifestPageDescriptor = serde_json::from_reader(File::open(path)?)?;
+        let d: ManifestPageDescriptor =
+            serde_json::from_reader(std::io::BufReader::new(File::open(path)?))?;
         if d.read_window_bytes != 0
             && (!(4096..=65536).contains(&d.read_window_bytes) || d.read_window_bytes % 4096 != 0)
         {
@@ -433,10 +434,13 @@ impl ManifestUffdMemorySource {
         }
         let mut zero_ranges = Vec::new();
         let mut previous_end = 0;
+        // Bound read-ahead to the table. The following SCM_RIGHTS byte must
+        // remain unread until recvmsg receives its descriptor.
+        let mut records = std::io::BufReader::with_capacity(65536, (&mut stream).take(count * 16));
         for _ in 0..count {
-            stream.read_exact(&mut size)?;
+            records.read_exact(&mut size)?;
             let start = u64::from_le_bytes(size);
-            stream.read_exact(&mut size)?;
+            records.read_exact(&mut size)?;
             let len = u64::from_le_bytes(size);
             if start < previous_end
                 || start > expected_size
@@ -448,6 +452,7 @@ impl ManifestUffdMemorySource {
             previous_end = start + len;
             zero_ranges.push((start, len));
         }
+        drop(records);
         let local = if d.local_file_plan {
             Some(LocalSnapshotPages::receive(
                 &mut stream,
@@ -467,6 +472,196 @@ impl ManifestUffdMemorySource {
             cached_windows: std::collections::VecDeque::new(),
         })
     }
+    /// Map authenticated immutable local extents without copying RAM.
+    /// Caller must supply fresh private anonymous windows, before any consumer
+    /// runs. Zero extents retain their original zero anonymous mapping.
+    /// All alignment checks precede the first MAP_FIXED; mapping errors abort
+    /// restore rather than falling back over a partially replaced address space.
+    pub(crate) unsafe fn map_local_cow(
+        &self,
+        windows: &[(u64, u64, u64, i32)],
+    ) -> io::Result<Option<Vec<(u64, u64)>>> {
+        let Some(local) = &self.local else {
+            return Ok(None);
+        };
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        if local
+            .extents
+            .iter()
+            .any(|&(off, len, _, _)| !off.is_multiple_of(page) || !len.is_multiple_of(page))
+        {
+            return Ok(None);
+        }
+        for &(off, len, host, _) in windows {
+            if !off.is_multiple_of(page)
+                || !len.is_multiple_of(page)
+                || !host.is_multiple_of(page)
+                || off > local.size
+                || len > local.size - off
+            {
+                return Err(io::Error::other("Invalid private mapping window"));
+            }
+        }
+        // A raw immutable ancestor is often split into thousands of selected
+        // ranges by newer pages. Map that ancestor once, then replace every
+        // non-ancestor byte (including explicit zeroes) before exposing RAM.
+        // Unaligned extents retain the original UFFD path: a seeded file PTE
+        // must never hide a missing-page fault that still needs the pager.
+        let seed = self.local_cow_seed(windows, page)?;
+        let mut mappings = 0usize;
+        if let Some((index, physical_base)) = seed {
+            for &(off, len, host, reserve) in windows {
+                // SAFETY: validated windows are exclusively owned, untouched
+                // guest mappings; seed selection checked the complete file span.
+                let mapped = unsafe {
+                    libc::mmap(
+                        host as *mut libc::c_void,
+                        len as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED | reserve,
+                        local.files[index].as_raw_fd(),
+                        (physical_base + off) as libc::off_t,
+                    )
+                };
+                if mapped == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                mappings += 1;
+            }
+        }
+        for &(off, len, host, reserve) in windows {
+            let end = off + len;
+            let first = local
+                .extents
+                .partition_point(|&(start, length, _, _)| start + length <= off);
+            for &(start, length, physical, index) in &local.extents[first..] {
+                if start >= end {
+                    break;
+                }
+                if !physical.is_multiple_of(page) || seed.is_some_and(|(file, _)| file == index) {
+                    continue;
+                }
+                let lo = off.max(start);
+                let hi = end.min(start + length);
+                let mapped = unsafe {
+                    libc::mmap(
+                        (host + lo - off) as *mut libc::c_void,
+                        (hi - lo) as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED | reserve,
+                        local.files[index].as_raw_fd(),
+                        (physical + lo - start) as libc::off_t,
+                    )
+                };
+                if mapped == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                mappings += 1;
+            }
+            if seed.is_some() {
+                for &(start, length) in &self.zero_ranges {
+                    let lo = off.max(start);
+                    let hi = end.min(start + length);
+                    if lo >= hi {
+                        continue;
+                    }
+                    // SAFETY: replace the seed's stale bytes with fresh zero
+                    // anonymous pages, still before KVM/device registration.
+                    let mapped = unsafe {
+                        libc::mmap(
+                            (host + lo - off) as *mut libc::c_void,
+                            (hi - lo) as usize,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | reserve,
+                            -1,
+                            0,
+                        )
+                    };
+                    if mapped == libc::MAP_FAILED {
+                        return Err(io::Error::last_os_error());
+                    }
+                    mappings += 1;
+                }
+            }
+        }
+        eprintln!(
+            "LOCAL_COW_PLAN extents={} seed={} mappings={mappings}",
+            local.extents.len(),
+            seed.is_some()
+        );
+        Ok(Some(
+            local
+                .extents
+                .iter()
+                .filter(|&&(_, _, physical, _)| !physical.is_multiple_of(page))
+                .map(|&(off, len, _, _)| (off, len))
+                .collect(),
+        ))
+    }
+    // Only affine, page-aligned raw ancestors can seed the address space.
+    // Selection is an optimization; all ownership/coverage checks in receive()
+    // and all alignment checks above remain mandatory.
+    fn local_cow_seed(
+        &self,
+        windows: &[(u64, u64, u64, i32)],
+        page: u64,
+    ) -> io::Result<Option<(usize, u64)>> {
+        let Some(local) = &self.local else {
+            return Ok(None);
+        };
+        if local.extents.iter().any(|e| !e.2.is_multiple_of(page))
+            || self
+                .zero_ranges
+                .iter()
+                .any(|&(o, n)| !o.is_multiple_of(page) || !n.is_multiple_of(page))
+        {
+            return Ok(None);
+        }
+        let mut best = None;
+        let mut saved = 0usize;
+        for (index, file) in local.files.iter().enumerate() {
+            let mut delta = None;
+            let mut count = 0usize;
+            let mut affine = true;
+            for &(off, _, physical, file_index) in &local.extents {
+                if file_index != index {
+                    continue;
+                }
+                let Some(current) = physical.checked_sub(off) else {
+                    affine = false;
+                    break;
+                };
+                if delta.is_some_and(|previous| previous != current) {
+                    affine = false;
+                    break;
+                }
+                delta = Some(current);
+                count += 1;
+            }
+            let Some(delta) = delta else {
+                continue;
+            };
+            if !affine || !delta.is_multiple_of(page) {
+                continue;
+            }
+            let size = file.metadata()?.len();
+            if windows.iter().any(|&(off, len, _, _)| {
+                delta
+                    .checked_add(off)
+                    .and_then(|p| p.checked_add(len))
+                    .is_none_or(|end| end > size)
+            }) {
+                continue;
+            }
+            let cost = windows.len() + self.zero_ranges.len();
+            if count > cost && count - cost > saved {
+                best = Some((index, delta));
+                saved = count - cost;
+            }
+        }
+        Ok(best)
+    }
+
     pub(crate) fn shutdown_fd(&self) -> io::Result<OwnedFd> {
         Ok(self.stream.try_clone()?.into())
     }
@@ -616,14 +811,16 @@ impl LocalSnapshotPages {
         }
         let mut extents = Vec::new();
         let mut end = 0;
+        let width = if multiple { 32 } else { 24 };
+        let mut records = std::io::BufReader::with_capacity(65536, stream.take(count * width));
         for _ in 0..count {
             let mut wire = [0; 24];
-            stream.read_exact(&mut wire)?;
+            records.read_exact(&mut wire)?;
             let start = u64::from_le_bytes(wire[..8].try_into().unwrap());
             let length = u64::from_le_bytes(wire[8..16].try_into().unwrap());
             let physical = u64::from_le_bytes(wire[16..].try_into().unwrap());
             let index = if multiple {
-                stream.read_exact(&mut word)?;
+                records.read_exact(&mut word)?;
                 u64::from_le_bytes(word)
             } else {
                 0
@@ -883,6 +1080,179 @@ mod manifest_tests {
     use super::*;
 
     #[test]
+    fn local_seed_overlays_data_and_zeroes_without_leaking_ancestor_bytes() {
+        let ancestor = tempfile::NamedTempFile::new().unwrap();
+        ancestor
+            .as_file()
+            .write_all_at(&vec![7; 8 * 4096], 0)
+            .unwrap();
+        let delta = tempfile::NamedTempFile::new().unwrap();
+        delta.as_file().write_all_at(&vec![9; 2 * 4096], 0).unwrap();
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut source = ManifestUffdMemorySource {
+            local: Some(LocalSnapshotPages {
+                files: vec![
+                    File::open(ancestor.path()).unwrap(),
+                    File::open(delta.path()).unwrap(),
+                ],
+                size: 8 * 4096,
+                extents: vec![
+                    (0, 4096, 0, 0),
+                    (4096, 4096, 0, 1),
+                    (8192, 4096, 8192, 0),
+                    (12288, 4096, 4096, 1),
+                    (16384, 4096, 16384, 0),
+                    (24576, 4096, 24576, 0),
+                ],
+            }),
+            stream,
+            buf: Vec::new(),
+            zero_ranges: vec![(20480, 4096), (28672, 4096)],
+            read_window_bytes: 65536,
+            cache_offset: 0,
+            cached_windows: Default::default(),
+        };
+        let size = 8 * 4096;
+        // SAFETY: both anonymous allocations are exclusively owned by this test;
+        // all reads/writes stay inside their bounds and both are unmapped below.
+        unsafe {
+            let allocate = || {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            let a = allocate();
+            let b = allocate();
+            assert_ne!(a, libc::MAP_FAILED);
+            assert_ne!(b, libc::MAP_FAILED);
+            let windows = [(0, size as u64, a as u64, 0)];
+            assert_eq!(source.local_cow_seed(&windows, 4096).unwrap(), Some((0, 0)));
+            assert_eq!(source.map_local_cow(&windows).unwrap(), Some(vec![]));
+            assert_eq!(
+                source
+                    .map_local_cow(&[(0, size as u64, b as u64, 0)])
+                    .unwrap(),
+                Some(vec![])
+            );
+            let first = std::slice::from_raw_parts_mut(a as *mut u8, size);
+            let second = std::slice::from_raw_parts_mut(b as *mut u8, size);
+            for (page, value) in [7, 9, 7, 9, 7, 0, 7, 0].into_iter().enumerate() {
+                assert!(
+                    first[page * 4096..(page + 1) * 4096]
+                        .iter()
+                        .all(|&x| x == value)
+                );
+                assert!(
+                    second[page * 4096..(page + 1) * 4096]
+                        .iter()
+                        .all(|&x| x == value)
+                );
+            }
+            first[0] = 1;
+            first[4096] = 2;
+            first[20480] = 3;
+            assert_eq!((second[0], second[4096], second[20480]), (7, 9, 0));
+            second[8192] = 4;
+            assert_eq!(first[8192], 7);
+            let mut byte = [0];
+            ancestor.as_file().read_exact_at(&mut byte, 0).unwrap();
+            assert_eq!(byte, [7]);
+            delta.as_file().read_exact_at(&mut byte, 0).unwrap();
+            assert_eq!(byte, [9]);
+            assert_eq!(libc::munmap(a, size), 0);
+            assert_eq!(libc::munmap(b, size), 0);
+        }
+        // A partial pager restore must not seed pages that need UFFD faults.
+        source.local.as_mut().unwrap().extents[1].2 = 1;
+        assert_eq!(
+            source
+                .local_cow_seed(&[(0, size as u64, 0, 0)], 4096)
+                .unwrap(),
+            None
+        );
+        source.local.as_mut().unwrap().extents[1].2 = 0;
+        ancestor.as_file().set_len(7 * 4096).unwrap();
+        assert_eq!(
+            source
+                .local_cow_seed(&[(0, size as u64, 0, 0)], 4096)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn local_manifest_cow_preserves_source_and_sibling() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(8192).unwrap();
+        tmp.as_file().write_all_at(&[7; 4096], 0).unwrap();
+        tmp.as_file().write_all_at(&[9; 4096], 4096).unwrap();
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut source = ManifestUffdMemorySource {
+            local: Some(LocalSnapshotPages {
+                files: vec![File::open(tmp.path()).unwrap()],
+                size: 12288,
+                extents: vec![(0, 4096, 0, 0), (8192, 4096, 4096, 0)],
+            }),
+            stream,
+            buf: Vec::new(),
+            zero_ranges: vec![(4096, 4096)],
+            read_window_bytes: 65536,
+            cache_offset: 0,
+            cached_windows: Default::default(),
+        };
+        let allocate = || unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                12288,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        let a = allocate();
+        let b = allocate();
+        assert_ne!(a, libc::MAP_FAILED);
+        assert_ne!(b, libc::MAP_FAILED);
+        unsafe {
+            assert_eq!(
+                source.map_local_cow(&[(0, 12288, a as u64, 0)]).unwrap(),
+                Some(vec![])
+            );
+            assert_eq!(
+                source.map_local_cow(&[(0, 12288, b as u64, 0)]).unwrap(),
+                Some(vec![])
+            );
+            let first = std::slice::from_raw_parts_mut(a as *mut u8, 12288);
+            let second = std::slice::from_raw_parts_mut(b as *mut u8, 12288);
+            assert_eq!(first[0], 7);
+            assert_eq!(first[4096], 0);
+            assert_eq!(first[8192], 9);
+            first[0] = 42;
+            second[8192] = 17;
+            assert_eq!(second[0], 7);
+            assert_eq!(first[8192], 9);
+            let mut byte = [0];
+            tmp.as_file().read_exact_at(&mut byte, 0).unwrap();
+            assert_eq!(byte, [7]);
+            // Unaligned sources must fall back before changing any mapping.
+            source.local.as_mut().unwrap().extents[0].2 = 1;
+            assert_eq!(
+                source.map_local_cow(&[(0, 12288, a as u64, 0)]).unwrap(),
+                Some(vec![(0, 4096)])
+            );
+            assert_eq!(first[0], 42);
+            assert_eq!(libc::munmap(a, 12288), 0);
+            assert_eq!(libc::munmap(b, 12288), 0);
+        }
+    }
+
+    #[test]
     fn manifest_local_file_handoff_checks_coverage_and_reads_unaligned_bytes() {
         for (physical, zero_start, valid) in [
             (3_u64, 4096_u64, true),
@@ -913,6 +1283,51 @@ mod manifest_tests {
                 assert!(source.read(&mut bytes, 1).is_err());
             }
         }
+    }
+
+    #[test]
+    fn manifest_buffering_preserves_rights_and_next_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("pages");
+        let descriptor = dir.path().join("descriptor");
+        let data = tempfile::NamedTempFile::new().unwrap();
+        data.as_file().write_all_at(&[7; 4096], 0).unwrap();
+        let fd = File::open(data.path()).unwrap();
+        std::fs::write(
+            &descriptor,
+            serde_json::to_vec(
+                &serde_json::json!({"socket":socket,"logical_bytes":8192,"local_file_plan":true}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for value in [8192_u64, 1, 4096, 4096] {
+                stream.write_all(&value.to_le_bytes()).unwrap();
+            }
+            stream.send_with_fd(&[1_u8][..], fd.as_raw_fd()).unwrap();
+            let mut bytes: Vec<u8> = [1_u64, 0, 4096, 0]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            bytes.push(0x42);
+            stream.write_all(&bytes).unwrap();
+        });
+        let mut source = ManifestUffdMemorySource::open(&descriptor, 8192).unwrap();
+        let mut byte = [0];
+        source.stream.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [0x42]);
+        let mut contents = [0; 4096];
+        source
+            .local
+            .as_ref()
+            .unwrap()
+            .read(&mut contents, 0)
+            .unwrap();
+        assert_eq!(contents, [7; 4096]);
+        server.join().unwrap();
     }
 
     #[test]

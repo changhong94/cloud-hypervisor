@@ -2203,7 +2203,10 @@ impl Vmm {
                     profile.halt_poll_ns = Some(200_000);
                     if prepared.profile != profile
                         || prepared.cpus != serde_json::to_value(&config.cpus).unwrap()
-                        || memory_restore_mode != MemoryRestoreMode::CopyOnWrite
+                        || !matches!(
+                            memory_restore_mode,
+                            MemoryRestoreMode::CopyOnWrite | MemoryRestoreMode::OnDemand
+                        )
                     {
                         return Err(VmError::ForkUnsupported(
                             "Prepared KVM profile does not match restore".into(),
