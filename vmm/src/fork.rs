@@ -496,7 +496,9 @@ fn validate_config(c: &VmConfig) -> Result<(), Error> {
                 })
         })
         || c.fs.is_some()
-        || c.pmem.is_some()
+        || c.pmem
+            .as_ref()
+            .is_some_and(|devices| devices.iter().any(|p| !p.readonly))
         || c.generic_vhost_user.is_some()
         || c.tpm.is_some()
         || c.platform.is_some()
@@ -954,6 +956,12 @@ impl Vmm {
         };
         trace_point("snapshot_done");
         let memory = vm.guest_memory().memory().into_inner();
+        // PMEM is outside guest RAM. Only immutable PMEM is admitted, and its
+        // old slot must be gone before remapping it in the restored device graph.
+        if let Err(error) = vm.detach_fork_device_memory() {
+            fork_log!("FATAL: cannot detach old device memory: {error}");
+            process::exit(1);
+        }
         let retired_disks = Arc::new(Mutex::new(vm.retain_fork_disks()));
         let retired_vm = if reuse {
             // This is a teardown commit after snapshot: a partial detach cannot
@@ -1907,6 +1915,25 @@ mod tests {
             "disks": [{"path": "/tmp/disk.raw", "readonly": true}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn fork_pmem_requires_enforced_readonly() {
+        let mut c = supported();
+        for (readonly, discard, accepted) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            c.pmem = Some(vec![
+                serde_json::from_value(serde_json::json!({
+                    "file": "/tmp/runtime", "readonly": readonly, "discard_writes": discard
+                }))
+                .unwrap(),
+            ]);
+            assert_eq!(validate_config(&c).is_ok(), accepted);
+        }
     }
 
     #[test]

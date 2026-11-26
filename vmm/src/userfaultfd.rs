@@ -6,6 +6,7 @@
 pub(crate) const UFFDIO_API: u64 = 0xc018_aa3f; // _IOWR(0xAA, 0x3F, struct uffdio_api)
 pub(crate) const UFFDIO_REGISTER: u64 = 0xc020_aa00; // _IOWR(0xAA, 0x00, struct uffdio_register)
 pub(crate) const UFFDIO_COPY: u64 = 0xc028_aa03; // _IOWR(0xAA, 0x03, struct uffdio_copy)
+pub(crate) const UFFDIO_ZEROPAGE: u64 = 0xc020_aa04; // _IOWR(0xAA, 0x04, struct uffdio_zeropage)
 pub(crate) const UFFDIO_WAKE: u64 = 0x8010_aa02; // _IOR(0xAA, 0x02, struct uffdio_range)
 pub(crate) const UFFDIO_CONTINUE: u64 = 0xc020_aa07; // _IOWR(0xAA, 0x07, struct uffdio_continue)
 pub(crate) const UFFDIO_POISON: u64 = 0xc020_aa08; // _IOWR(0xAA, 0x08, struct uffdio_poison)
@@ -53,3 +54,6 @@ const _UFFDIO_CONTINUE: u64 = 0x07;
 pub(crate) const UFFD_API_RANGE_IOCTLS_BASIC: u64 = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY);
 pub(crate) const UFFD_API_RANGE_IOCTLS_MINOR: u64 =
     UFFD_API_RANGE_IOCTLS_BASIC | (1 << _UFFDIO_CONTINUE);
+
+const _: () = assert!(UFFDIO_ZEROPAGE == ioctl_ioc(IOC_READWRITE, 0xAA, 0x04, 32));
+const _: () = assert!(UFFDIO_ZEROPAGE <= u32::MAX as u64);

@@ -2877,7 +2877,13 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 if vm.restoring() && !vm.incremental_memory() {
-                    return Err(VmError::VmRestoring);
+                    // A lazy immutable snapshot keeps its pager alive until
+                    // export. Finish it before taking the complete snapshot;
+                    // incoming postcopy migration still retains its guard.
+                    vm.finish_demand_snapshot_restore()?;
+                    if vm.restoring() {
+                        return Err(VmError::VmRestoring);
+                    }
                 }
                 // Drain console_info so that FDs are not reused
                 let _ = self.console_info.take();
@@ -3700,7 +3706,10 @@ impl RequestHandler for Vmm {
         send_data_migration: VmSendMigrationData,
     ) -> result::Result<(), MigratableError> {
         match self.vm {
-            VmOwnership::Owned(ref vm) => {
+            VmOwnership::Owned(ref mut vm) => {
+                vm.finish_demand_snapshot_restore().map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("Demand restore materialization: {e}"))
+                })?;
                 if vm.restoring() {
                     return Err(MigratableError::Conflict(anyhow!(
                         "An on-demand memory restore is still in progress"

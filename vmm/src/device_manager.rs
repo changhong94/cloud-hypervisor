@@ -2777,6 +2777,33 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Called only after the fork snapshot commits with all vCPUs and devices
+    /// paused. Remove device slots before dropping their host mappings, also
+    /// when retaining the parent's KVM. The caller fails closed on any error.
+    pub(crate) fn detach_fork_device_memory(&self) -> std::io::Result<()> {
+        for handle in &self.virtio_devices {
+            let device = handle.virtio_device.lock().unwrap();
+            for mapping in device.userspace_mappings() {
+                // SAFETY: the paused device owns this live mapping until
+                // teardown, and no vCPU can reenter KVM_RUN during detach.
+                unsafe {
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .remove_userspace_mapping(
+                            mapping.addr.raw_value(),
+                            mapping.mapping.len(),
+                            mapping.mapping.as_ptr(),
+                            mapping.mergeable,
+                            mapping.mem_slot,
+                        )
+                        .map_err(std::io::Error::other)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A retained KVM must not keep the old transport event registrations.
     /// Only validated local virtio devices are supported by the fork profile.
     pub(crate) fn detach_fork_events(&self, parallel: bool) -> std::io::Result<()> {
@@ -3628,7 +3655,7 @@ impl DeviceManager {
 
         let mut file = OpenOptions::new()
             .read(true)
-            .write(!pmem_cfg.discard_writes)
+            .write(!pmem_cfg.discard_writes && !pmem_cfg.readonly)
             .custom_flags(custom_flags)
             .open(&pmem_cfg.file)
             .map_err(DeviceManagerError::PmemFileOpen)?;
@@ -3680,7 +3707,11 @@ impl DeviceManager {
         let mmap_region = MmapRegion::build(
             Some(FileOffset::new(cloned_file, 0)),
             region_size as usize,
-            PROT_READ | PROT_WRITE,
+            if pmem_cfg.readonly {
+                PROT_READ
+            } else {
+                PROT_READ | PROT_WRITE
+            },
             MAP_NORESERVE
                 | if pmem_cfg.discard_writes {
                     MAP_PRIVATE
@@ -3702,7 +3733,7 @@ impl DeviceManager {
                     region_size,
                     host_addr,
                     false,
-                    false,
+                    pmem_cfg.readonly,
                     false,
                     hypervisor::MemoryVisibility::Shared,
                 )

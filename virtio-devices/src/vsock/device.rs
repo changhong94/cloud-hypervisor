@@ -108,6 +108,22 @@ pub(crate) struct VsockEpollHandler<B: VsockBackend> {
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
 }
 
+fn trace_restore_reset(event: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var("KUASAR_VSOCK_TIMELINE").as_deref() == Ok("1")) {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let line = format!(
+            "VSOCK_RESET ns={ns} pid={} thread={:?} event={event}\n",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+    }
+}
+
 impl<B> VsockEpollHandler<B>
 where
     B: VsockBackend,
@@ -118,6 +134,7 @@ where
         if !self.reset_pending {
             return Ok(());
         }
+        trace_restore_reset("reset_processing");
         while let Some(mut chain) = self.queues[2].pop_descriptor_chain(self.mem.memory()) {
             let head = chain.head_index();
             let valid = chain
@@ -150,6 +167,7 @@ where
             self.signal_used_queue(2)
                 .map_err(|e| EpollHelperError::HandleEvent(anyhow!("vsock reset IRQ: {e}")))?;
             if valid {
+                trace_restore_reset("reset_dispatched");
                 self.reset_pending = false;
                 break;
             }
@@ -171,6 +189,7 @@ where
             if current == before {
                 return Ok(false);
             }
+            trace_restore_reset("reset_acknowledged");
             self.reset_ack_avail = None;
         }
         Ok(true)
@@ -317,6 +336,7 @@ where
         self.process_reset()?;
         let ready = self.reset_complete()?;
         if ready && !self.backend_registered {
+            trace_restore_reset("backend_enabled");
             helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
             self.backend_registered = true;
         }

@@ -71,6 +71,7 @@ struct UffdHandler {
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
     prefault_complete: Arc<AtomicBool>,
+    materialize_on_export: bool,
 }
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -1105,7 +1106,7 @@ impl MemoryManager {
             Option<OwnedFd>,
         ) = if descriptor.exists() {
             let manifest_started = std::time::Instant::now();
-            let source = crate::uffd::ManifestUffdMemorySource::open(
+            let mut source = crate::uffd::ManifestUffdMemorySource::open(
                 &descriptor,
                 saved_regions.ranges().iter().map(|r| r.length).sum(),
             )
@@ -1126,6 +1127,16 @@ impl MemoryManager {
             // Only untouched private RAM may be overlaid. Shared/VFIO mappings
             // and unaligned/encrypted/remote sources retain UFFD semantics.
             let guest_memory = self.guest_memory.memory();
+            // Native private ownership has no external shared-memory backend.
+            // Hugepage/shared layouts retain the existing in-process handler.
+            source.native_handler &= self
+                .memory_zones
+                .values()
+                .all(|z| !z.shared && !z.hugepages)
+                && is_restore_cow_compatible(&guest_memory, saved_regions)
+                && guest_memory
+                    .iter()
+                    .all(|r| r.flags() & libc::MAP_SHARED == 0);
             if is_restore_cow_compatible(&guest_memory, saved_regions)
                 && guest_memory
                     .iter()
@@ -1149,9 +1160,16 @@ impl MemoryManager {
                 // SAFETY: compatibility above proves fresh anonymous private
                 // windows; restore has not exposed them to a running vCPU.
                 let mapping_started = std::time::Instant::now();
-                if let Some(missing) =
+                if let Some(mut missing) =
                     unsafe { source.map_local_cow(&windows) }.map_err(Error::SnapshotMmap)?
                 {
+                    if d["initialize_delta"].as_bool().unwrap_or(false) {
+                        // SAFETY: these are the same fresh private windows just
+                        // mapped above, before any guest consumer is registered.
+                        unsafe { source.initialize_delta(&windows, &missing) }
+                            .map_err(Error::SnapshotMmap)?;
+                        missing.clear();
+                    }
                     let bytes: u64 = missing.iter().map(|(_, len)| *len).sum();
                     eprintln!(
                         "LOCAL_COW mapped_bytes={} uffd_bytes={bytes} manifest_open_us={manifest_open_us} mapping_us={}",
@@ -1206,6 +1224,7 @@ impl MemoryManager {
                 o
             },
             source.requires_uffd_minor_mode(),
+            source.native_handler(),
         )?
         else {
             return Ok(());
@@ -1216,6 +1235,7 @@ impl MemoryManager {
         let served_bitmap: Vec<AtomicBitmap> = uffd
             .ranges()
             .iter()
+            .filter(|_| !source.native_handler())
             .map(|r| {
                 AtomicBitmap::new(
                     r.length as usize,
@@ -1259,13 +1279,18 @@ impl MemoryManager {
                 }
             }
         }
+        // Manifest snapshots retain an authenticated immutable source owner.
+        // Match native demand paging: do not read unrequested RAM just because
+        // epoll is momentarily idle. Export/fork explicitly materialize first.
+        let manifest_source = snapshot_file.is_none();
         self.spawn_uffd_handler(
             uffd,
             shutdown_fd,
             served_bitmap,
             source,
             exit_evt,
-            self.incremental_memory.is_none(),
+            self.incremental_memory.is_none() && !manifest_source,
+            manifest_source,
         )?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
@@ -1291,8 +1316,12 @@ impl MemoryManager {
             Box::new(SocketUffdMemorySource::new(socket, shared_backing));
 
         // PageFault uses the GPA as the page identifier on the wire.
-        let Some(uffd) =
-            self.prepare_uffd(saved_regions, |r| r.gpa, source.requires_uffd_minor_mode())?
+        let Some(uffd) = self.prepare_uffd(
+            saved_regions,
+            |r| r.gpa,
+            source.requires_uffd_minor_mode(),
+            false,
+        )?
         else {
             return Ok(());
         };
@@ -1315,6 +1344,7 @@ impl MemoryManager {
             source,
             exit_evt,
             background_fetch_pages,
+            false,
         )
     }
 
@@ -1324,6 +1354,7 @@ impl MemoryManager {
         saved_regions: &MemoryRangeTable,
         mut source_offset_for: F,
         uffd_requires_minor_mode: bool,
+        native_handler: bool,
     ) -> Result<Option<Uffd>, Error>
     where
         F: FnMut(&MemoryRange) -> u64,
@@ -1333,7 +1364,12 @@ impl MemoryManager {
         }
 
         let guest_memory = self.guest_memory.memory();
-        let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
+        let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode)
+            | if native_handler {
+                (1 << 2) | (1 << 3) | (1 << 6)
+            } else {
+                0
+            };
 
         // SAFETY: FFI call. Trivially safe.
         let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
@@ -1417,6 +1453,7 @@ impl MemoryManager {
         source: Box<dyn UffdMemorySource>,
         exit_evt: &EventFd,
         background_fetch_pages: bool,
+        materialize_on_export: bool,
     ) -> Result<(), Error> {
         info!(
             "UFFD: spawning handler for {} region(s)",
@@ -1482,6 +1519,7 @@ impl MemoryManager {
             handle,
             fault_socket_fd,
             prefault_complete,
+            materialize_on_export,
         });
 
         Ok(())
@@ -1542,9 +1580,50 @@ impl MemoryManager {
         self.vm.start_dirty_log().map_err(io::Error::other)
     }
 
-    // Host fork requires no outstanding UFFD owner. Populate before its existing
-    // quiescence barrier; snapshots themselves do not take this path.
+    // Complete immutable lazy sources before exporting a self-contained image.
+    // Incoming postcopy is not owned here and retains its original guard.
+    pub fn finish_demand_snapshot_restore(&mut self) -> io::Result<()> {
+        if let Some(handler) = &self.uffd_handler
+            && handler.materialize_on_export
+        {
+            let started = time::Instant::now();
+            // Reuse the existing eventfd. Bit 0 is shutdown; bit 1 requests
+            // completion. The handler skips known zero/already served pages,
+            // then unregisters UFFD before acknowledging export readiness.
+            handler.stop_event.write(2)?;
+            let result = handler
+                .result_rx
+                .recv()
+                .map_err(|_| io::Error::other("Demand restore handler disconnected"))?;
+            result?;
+            if !handler.prefault_complete.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "Demand restore ended before materialization",
+                ));
+            }
+            let handler = self.uffd_handler.take().unwrap();
+            handler
+                .handle
+                .join()
+                .map_err(|_| io::Error::other("Demand restore handler panicked"))?;
+            info!(
+                "Demand snapshot export materialized in {:?}",
+                started.elapsed()
+            );
+        }
+        Ok(())
+    }
+
+    // Host fork cannot inherit an outstanding UFFD owner. Populate before its
+    // existing quiescence barrier and join the servicing thread.
     pub fn finish_incremental_restore_for_fork(&mut self) -> io::Result<()> {
+        if self
+            .uffd_handler
+            .as_ref()
+            .is_some_and(|h| h.materialize_on_export)
+        {
+            return self.finish_demand_snapshot_restore();
+        }
         // Both local and Manifest private restores can still own missing
         // pages. Fork cannot inherit a missing-page registration without its
         // servicing thread, irrespective of incremental snapshot metadata.
@@ -1661,6 +1740,19 @@ impl MemoryManager {
         prefault_complete: &AtomicBool,
         background_fetch_pages: bool,
     ) -> Result<(), io::Error> {
+        if source.native_handler() {
+            if uffds.len() != 1 {
+                return Err(io::Error::other("Native UFFD expects one owner"));
+            }
+            source.native_start(&uffds[0])?;
+            ready_tx.send(()).ok();
+            if source.native_wait(stop_event)? {
+                // The native owner has joined; dropping the final CH UFFD
+                // after this loop removes registration before result delivery.
+                prefault_complete.store(true, Ordering::Release);
+            }
+            return Ok(());
+        }
         let vmm_uffd = &uffds[0];
         let ranges = vmm_uffd.ranges();
 
@@ -1672,6 +1764,7 @@ impl MemoryManager {
 
         let mut prefault_active = background_fetch_pages && !ranges.is_empty();
         let mut source_failed = false;
+        let mut export_requested = false;
         let mut range_idx = 0;
         let mut page_idx = 0;
         let prefault_start = time::Instant::now();
@@ -1720,9 +1813,16 @@ impl MemoryManager {
                 .take(num_events)
                 .any(|event| event.data == EVENT_STOP)
             {
-                stop_event.read().ok();
-                info!("UFFD handler: received stop event, exiting");
-                return Ok(());
+                let command = stop_event.read()?;
+                if command & 1 != 0 {
+                    info!("UFFD handler: received stop event, exiting");
+                    return Ok(());
+                }
+                if command & 2 != 0 {
+                    prefault_active = true;
+                    export_requested = true;
+                }
+                continue;
             }
 
             let mut ready_uffd = None;
@@ -1781,6 +1881,13 @@ impl MemoryManager {
                     continue;
                 }
 
+                if !minor_fault
+                    && served_bitmap[range_idx].is_bit_set(page_idx as usize)
+                    && source.resolve_served(fault_uffd.fd(), range, page_idx)?
+                {
+                    continue;
+                }
+
                 // A missing fault on a served page is either a discard, or a
                 // fault queued on another userfaultfd while the page was
                 // being resolved. Only the latter leaves the page present.
@@ -1792,6 +1899,12 @@ impl MemoryManager {
                     continue;
                 }
 
+                uffd::trace_remote_fault(
+                    "event",
+                    range.page_source_offset(page_idx),
+                    range.page_size,
+                    i32::from(served_bitmap[range_idx].is_bit_set(page_idx as usize)),
+                );
                 let key = (range_idx, page_idx);
 
                 let served_minor = {
@@ -1840,13 +1953,16 @@ impl MemoryManager {
                     continue;
                 }
 
-                let result = source.resolve(fault_uffd.fd(), range, page_idx);
+                let result =
+                    source.resolve(fault_uffd.fd(), range, page_idx, &served_bitmap[range_idx]);
 
                 {
                     let mut loading = pages_loading.lock().unwrap();
 
-                    if result.is_ok() {
-                        served_bitmap[range_idx].set_bit(page_idx as usize);
+                    if let Ok(populated) = &result {
+                        for page in populated.clone() {
+                            served_bitmap[range_idx].set_bit(page as usize);
+                        }
                     }
 
                     loading.remove(&key);
@@ -1912,7 +2028,12 @@ impl MemoryManager {
                 }
                 Ok(prefaulted) => pages_prefaulted += prefaulted,
                 Err(e) => {
-                    // Give up prefaulting but continue serving demand faults.
+                    // An explicit export must fail rather than acknowledge a
+                    // partially restored image or leave its caller waiting.
+                    if export_requested {
+                        return Err(e);
+                    }
+                    // Give up speculative prefault but keep demand service.
                     warn!("UFFD prefault: abandoning background prefault after error: {e}");
                     prefault_active = false;
                 }
@@ -1968,20 +2089,27 @@ impl MemoryManager {
                 continue 'outer;
             }
 
-            let result = source.resolve(uffd_fd, range, current_page_idx);
+            let result = source.resolve(
+                uffd_fd,
+                range,
+                current_page_idx,
+                &served_bitmap[current_range_idx],
+            );
 
             {
                 let mut loading = pages_loading.lock().unwrap();
 
-                if result.is_ok() {
-                    served_bitmap[current_range_idx].set_bit(current_page_idx as usize);
+                if let Ok(populated) = &result {
+                    for page in populated.clone() {
+                        served_bitmap[current_range_idx].set_bit(page as usize);
+                    }
                 }
 
                 loading.remove(&key);
             }
 
             match result {
-                Ok(()) => {
+                Ok(_) => {
                     current_page_idx += 1;
 
                     *range_idx = current_range_idx;
@@ -4474,7 +4602,8 @@ mod tests {
             _uffd_fd: BorrowedFd<'_>,
             range: &UffdRange,
             page_idx: u64,
-        ) -> Result<(), io::Error> {
+            _served: &AtomicBitmap,
+        ) -> Result<std::ops::Range<u64>, io::Error> {
             self.attempts
                 .lock()
                 .unwrap()
@@ -4485,7 +4614,7 @@ mod tests {
                 return Err(io::Error::other("test source failure"));
             }
 
-            Ok(())
+            Ok(page_idx..page_idx + 1)
         }
 
         fn requires_uffd_minor_mode(&self) -> bool {
@@ -4508,6 +4637,66 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn uffd_demand_mode_does_not_read_idle_pages() {
+        for (background, materialize, fail) in [
+            (false, false, false),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+        ] {
+            // A socket with no input stands in for a UFFD with no page faults.
+            let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let ranges = vec![UffdRange {
+                host_addr: 0x10_0000,
+                length: 4096,
+                source_offset: 0,
+                page_size: 4096,
+            }]
+            .into_boxed_slice();
+            let served = new_served_bitmap(&ranges);
+            let uffd = Uffd::new(reader.into(), ranges).unwrap();
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let source = Box::new(RecordingUffdMemorySource {
+                attempts: Arc::clone(&attempts),
+                fail_next: fail,
+            });
+            let stop = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let thread_stop = stop.try_clone().unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let thread_done = Arc::clone(&done);
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let exit = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+                MemoryManager::uffd_handler_loop(
+                    &[uffd],
+                    &thread_stop,
+                    &exit,
+                    source,
+                    served,
+                    &ready_tx,
+                    &thread_done,
+                    background,
+                )
+            });
+            ready_rx.recv().unwrap();
+            if background {
+                worker.join().unwrap().unwrap();
+                assert_eq!(attempts.lock().unwrap().len(), 1);
+                assert!(done.load(Ordering::Acquire));
+            } else {
+                thread::sleep(time::Duration::from_millis(20));
+                assert!(attempts.lock().unwrap().is_empty());
+                assert!(!done.load(Ordering::Acquire));
+                stop.write(if materialize { 2 } else { 1 }).unwrap();
+                let result = worker.join().unwrap();
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(attempts.lock().unwrap().len(), usize::from(materialize));
+                assert_eq!(done.load(Ordering::Acquire), materialize && !fail);
+            }
+        }
     }
 
     #[test]

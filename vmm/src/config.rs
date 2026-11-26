@@ -2410,7 +2410,7 @@ impl FwCfgItem {
 impl PmemConfig {
     pub const SYNTAX: &'static str = "Persistent memory parameters \
     \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=off|virtio,\
-    discard_writes=on|off,id=<device_id>,\
+    discard_writes=on|off,readonly=on|off,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(pmem: &str) -> Result<Self> {
@@ -2419,6 +2419,7 @@ impl PmemConfig {
             .add("size")
             .add("file")
             .add("discard_writes")
+            .add("readonly")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(pmem).map_err(Error::ParsePersistentMemory)?;
 
@@ -2439,6 +2440,11 @@ impl PmemConfig {
             file,
             size,
             discard_writes,
+            readonly: parser
+                .convert::<Toggle>("readonly")
+                .map_err(Error::ParsePersistentMemory)?
+                .unwrap_or(Toggle(false))
+                .0,
         })
     }
 
@@ -5112,11 +5118,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             file: PathBuf::from("/tmp/pmem"),
             size: Some(128 << 20),
             discard_writes: false,
+            readonly: false,
         }
     }
 
     #[test]
     fn test_pmem_parsing() -> Result<()> {
+        assert!(PmemConfig::parse("file=/tmp/pmem,readonly=on")?.readonly);
+        assert!(!PmemConfig::parse("file=/tmp/pmem,discard_writes=on")?.readonly);
         // Must always give a file and size
         PmemConfig::parse("").unwrap_err();
         PmemConfig::parse("size=128M").unwrap_err();

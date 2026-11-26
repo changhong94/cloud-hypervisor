@@ -1520,6 +1520,10 @@ components:
           format: int64
         iommu:
           $ref: "#/components/schemas/IommuType"
+        readonly:
+          type: boolean
+          default: false
+          description: Enforce an immutable host mapping and hypervisor memory slot.
         discard_writes:
           type: boolean
           default: false

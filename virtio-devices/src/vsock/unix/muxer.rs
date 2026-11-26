@@ -141,6 +141,24 @@ pub struct VsockMuxer {
     local_port_last: u32,
 }
 
+// Optional handshake-only tracing; no packet payload or guest data is logged.
+fn trace_restore_vsock(event: &str, cid: u64, local_port: u32, peer_port: u32) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("KUASAR_VSOCK_TIMELINE").as_deref() == Ok("1")) {
+        return;
+    }
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let line = format!(
+        "VSOCK_TIMELINE ns={ns} pid={} thread={:?} event={event} cid={cid} local_port={local_port} peer_port={peer_port}\n",
+        std::process::id(),
+        std::thread::current().id()
+    );
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+}
+
 impl VsockChannel for VsockMuxer {
     /// Deliver a vsock packet to the guest vsock driver.
     ///
@@ -196,6 +214,14 @@ impl VsockChannel for VsockMuxer {
             };
 
             if res.is_ok() {
+                if pkt.op() == uapi::VSOCK_OP_REQUEST {
+                    trace_restore_vsock(
+                        "request_packet_built",
+                        self.cid,
+                        pkt.src_port(),
+                        pkt.dst_port(),
+                    );
+                }
                 // Inspect traffic, looking for RST packets, since that means we have to
                 // terminate and remove this connection from the active connection pool.
                 //
@@ -224,6 +250,14 @@ impl VsockChannel for VsockMuxer {
     /// returned to the guest vsock driver.
     ///
     fn send_pkt(&mut self, pkt: &VsockPacket) -> VsockResult<()> {
+        if pkt.op() == uapi::VSOCK_OP_RESPONSE {
+            trace_restore_vsock(
+                "guest_response_received",
+                self.cid,
+                pkt.dst_port(),
+                pkt.src_port(),
+            );
+        }
         let conn_key = ConnMapKey {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
@@ -585,6 +619,14 @@ impl VsockMuxer {
     /// Add a new connection to the active connection pool.
     ///
     fn add_connection(&mut self, key: ConnMapKey, conn: MuxerConnection) -> Result<()> {
+        if conn.state() == ConnState::LocalInit {
+            trace_restore_vsock(
+                "host_connection_accepted",
+                self.cid,
+                key.local_port,
+                key.peer_port,
+            );
+        }
         // We might need to make room for this new connection, so let's sweep the kill queue
         // first.  It's fine to do this here because:
         // - unless the kill queue is out of sync, this is a pretty inexpensive operation; and
@@ -769,6 +811,12 @@ impl VsockMuxer {
             // If this is a host-initiated connection that has just become established, we'll have
             // to send an ack message to the host end.
             if prev_state == ConnState::LocalInit && conn.state() == ConnState::Established {
+                trace_restore_vsock(
+                    "connection_established",
+                    self.cid,
+                    key.local_port,
+                    key.peer_port,
+                );
                 let msg = format!("OK {}\n", key.local_port);
                 match conn.send_bytes_raw(msg.as_bytes()) {
                     Ok(written) if written == msg.len() => (),

@@ -690,11 +690,18 @@ pub struct PmemConfig {
     pub size: Option<u64>,
     #[serde(default)]
     pub discard_writes: bool,
+    /// Enforce an immutable mapping in both the host and hypervisor.
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 impl ApplyLandlock for PmemConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        let access = if self.discard_writes { "r" } else { "rw" };
+        let access = if self.discard_writes || self.readonly {
+            "r"
+        } else {
+            "rw"
+        };
         landlock.add_rule_with_access(&self.file, access)?;
         Ok(())
     }

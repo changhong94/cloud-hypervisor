@@ -608,6 +608,13 @@ impl Vm {
             .detach_fork_events(parallel)
     }
 
+    pub(crate) fn detach_fork_device_memory(&self) -> std::io::Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .detach_fork_device_memory()
+    }
+
     pub(crate) fn retain_fork_disks(&self) -> Vec<Box<dyn block::disk_file::ForkRetirement>> {
         self.device_manager.lock().unwrap().retain_fork_disks()
     }
@@ -3306,6 +3313,14 @@ impl Vm {
 
     pub fn incremental_memory(&self) -> bool {
         self.memory_manager.lock().unwrap().incremental_memory()
+    }
+
+    pub fn finish_demand_snapshot_restore(&mut self) -> Result<()> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .finish_demand_snapshot_restore()
+            .map_err(|e| Error::Restore(MigratableError::Restore(e.into())))
     }
 
     pub fn finish_incremental_restore_for_fork(&mut self) -> Result<()> {
