@@ -1163,6 +1163,10 @@ impl MemoryManager {
                 if let Some(mut missing) =
                     unsafe { source.map_local_cow(&windows) }.map_err(Error::SnapshotMmap)?
                 {
+                    let mmap_us = mapping_started.elapsed().as_micros();
+                    let delta_started = std::time::Instant::now();
+                    let delta_ranges = missing.len();
+                    let delta_bytes: u64 = missing.iter().map(|(_, len)| *len).sum();
                     if d["initialize_delta"].as_bool().unwrap_or(false) {
                         // SAFETY: these are the same fresh private windows just
                         // mapped above, before any guest consumer is registered.
@@ -1170,9 +1174,10 @@ impl MemoryManager {
                             .map_err(Error::SnapshotMmap)?;
                         missing.clear();
                     }
+                    let delta_us = delta_started.elapsed().as_micros();
                     let bytes: u64 = missing.iter().map(|(_, len)| *len).sum();
                     eprintln!(
-                        "LOCAL_COW mapped_bytes={} uffd_bytes={bytes} manifest_open_us={manifest_open_us} mapping_us={}",
+                        "LOCAL_COW mapped_bytes={} uffd_bytes={bytes} manifest_open_us={manifest_open_us} mapping_us={} mmap_us={mmap_us} delta_us={delta_us} delta_ranges={delta_ranges} delta_bytes={delta_bytes}",
                         offset - bytes,
                         mapping_started.elapsed().as_micros()
                     );
