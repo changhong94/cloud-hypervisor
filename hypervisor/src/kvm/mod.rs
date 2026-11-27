@@ -1749,13 +1749,15 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         let mark = |phase: &str| {
             if let Some(started) = timing {
                 use std::io::Write;
-                let _ = writeln!(
-                    std::io::stderr().lock(),
-                    "VM_KVM_INIT pid={} phase={} elapsed_ms={:.6}",
+                let line = format!(
+                    "VM_KVM_INIT pid={} phase={} elapsed_ms={:.6}\n",
                     std::process::id(),
                     phase,
                     started.elapsed().as_secs_f64() * 1000.0
                 );
+                // One write keeps concurrent VMM records intact and avoids a
+                // separate stderr syscall for each formatted field.
+                let _ = std::io::stderr().lock().write_all(line.as_bytes());
             }
         };
         let fd: VmFd;
